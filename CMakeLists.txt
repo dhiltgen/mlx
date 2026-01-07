@@ -152,12 +152,22 @@ add_library(mlx)
 
 # Supress warnings: note: parameter passing for argument of type
 # ‘std::pair<float, float>’ when C++17 is enabled changed to match C++14 in GCC
-# 10.1
-target_compile_options(mlx PRIVATE -Wno-psabi)
+# 10.1 Only apply -Wno-psabi on GCC/Clang, not MSVC or NVCC
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(mlx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-psabi>)
+endif()
 target_compile_options(mlx PUBLIC ${SANITIZER_COMPILE_FLAGS})
 target_link_options(mlx PUBLIC ${SANITIZER_LINK_FLAGS})
 
 if(MLX_BUILD_CUDA)
+  # On Windows DLLs, use dynamic CUDA runtime to avoid static initialization
+  # issues. The static CUDA runtime causes kernel registration to fail because
+  # the CUDA context is not available during DLL loading, and we can't
+  # initialize it during static init without deadlocking due to loader lock.
+  if(WIN32 AND BUILD_SHARED_LIBS)
+    message(STATUS "Using dynamic CUDA runtime for Windows DLL compatibility")
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+  endif()
   enable_language(CUDA)
 endif()
 
@@ -224,6 +234,24 @@ if(WIN32)
     set(MLX_BUILD_GGUF OFF)
     # There is no prebuilt OpenBLAS distribution for MSVC.
     set(MLX_BUILD_BLAS_FROM_SOURCE ON)
+    # Prevent Windows.h from defining min/max macros that break
+    # std::min/std::max and CCCL headers (cuda::std::min, cuda::std::max).
+    target_compile_definitions(mlx PRIVATE NOMINMAX)
+    # Enable /bigobj for heavily templated code (e.g., binary.cpp) that exceeds
+    # the default 65,535 section limit in COFF object files. Use generator
+    # expression to only apply to C/CXX, not CUDA (NVCC doesn't understand
+    # /bigobj directly).
+    target_compile_options(mlx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+    # Windows DLLs have a 65535 symbol export limit. We use explicit exports via
+    # MLX_API macro (__declspec(dllexport)) on public API functions only. This
+    # avoids exporting internal CUDA template instantiations.
+    if(BUILD_SHARED_LIBS)
+      message(STATUS "Building MLX as shared library - defining MLX_EXPORT")
+      target_compile_definitions(mlx PRIVATE MLX_EXPORT)
+    else()
+      message(STATUS "Building MLX as static library - defining MLX_STATIC")
+      target_compile_definitions(mlx PUBLIC MLX_STATIC)
+    endif()
   endif()
   # Windows implementation of dlfcn.h APIs.
   FetchContent_Declare(
@@ -260,9 +288,14 @@ if(MLX_BUILD_CPU)
       GIT_REPOSITORY https://github.com/OpenMathLib/OpenBLAS.git
       GIT_TAG v0.3.28
       EXCLUDE_FROM_ALL)
+    # Save BUILD_SHARED_LIBS before OpenBLAS modifies it (OpenBLAS's CMake
+    # disables BUILD_SHARED_LIBS on MSVC when BUILD_STATIC_LIBS is ON)
+    set(_MLX_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
     set(BUILD_STATIC_LIBS ON) # link statically
     set(NOFORTRAN ON) # msvc has no fortran compiler
     FetchContent_MakeAvailable(openblas)
+    # Restore BUILD_SHARED_LIBS
+    set(BUILD_SHARED_LIBS ${_MLX_SAVED_BUILD_SHARED_LIBS})
     target_link_libraries(mlx PRIVATE openblas)
     target_include_directories(
       mlx PRIVATE "${openblas_SOURCE_DIR}/lapack-netlib/LAPACKE/include"

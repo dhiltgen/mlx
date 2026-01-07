@@ -22,16 +22,33 @@ target_sources(
 # Define MLX_VERSION only in the version.cpp file.
 add_library(mlx_version OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/version.cpp)
 target_compile_definitions(mlx_version PRIVATE MLX_VERSION="${MLX_VERSION}")
+# On Windows shared lib builds, mlx_version also needs MLX_EXPORT for proper DLL
+# linkage
+if(WIN32 AND BUILD_SHARED_LIBS)
+  target_compile_definitions(mlx_version PRIVATE MLX_EXPORT)
+endif()
 target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:mlx_version>)
 
 if(MSVC)
-  # Disable some MSVC warnings to speed up compilation.
-  target_compile_options(mlx PUBLIC /wd4068 /wd4244 /wd4267 /wd4804)
+  # Disable some MSVC warnings to speed up compilation. For C++ files, pass
+  # flags directly; for CUDA files, wrap with -Xcompiler
+  target_compile_options(
+    mlx
+    PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/wd4068
+           /wd4244
+           /wd4267
+           /wd4804>
+           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4068
+           -Xcompiler=/wd4244
+           -Xcompiler=/wd4267
+           -Xcompiler=/wd4804>)
 endif()
 
 if(WIN32)
-  # Export symbols by default to behave like macOS/linux.
-  set_target_properties(mlx PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+  # On Windows, we use explicit __declspec(dllexport) via MLX_API macro instead
+  # of WINDOWS_EXPORT_ALL_SYMBOLS to avoid exceeding the 65535 symbol export
+  # limit (CUDA template instantiations generate 100k+ symbols).
+  set_target_properties(mlx PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS FALSE)
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/common)

@@ -158,15 +158,14 @@ void fp_quantize(
       auto [num_blocks, block_dims] =
           get_launch_args(w.size(), w.shape(), w.strides(), large, group_size);
 
+      // Store params in variables to ensure they remain valid
+      T* w_ptr = const_cast<T*>(gpu_ptr<T>(w));
+      uint8_t* wq_ptr = gpu_ptr<uint8_t>(wq);
+      uint8_t* scales_ptr = gpu_ptr<uint8_t>(scales);
+      size_t w_size = w.size();
+      void* params[] = {&w_ptr, &wq_ptr, &scales_ptr, &w_size};
       enc.add_kernel_node(
-          kernel,
-          num_blocks,
-          block_dims,
-          0,
-          gpu_ptr<T>(w),
-          gpu_ptr<uint8_t>(wq),
-          gpu_ptr<uint8_t>(scales),
-          w.size());
+          reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, params);
     } else {
       throw std::runtime_error(
           "[Quantize::eval_gpu] Can not quantize input with type float64.");
@@ -204,15 +203,14 @@ void fp_dequantize(
       }
       auto [num_blocks, block_dims] =
           get_launch_args(size, grid_shape, w.strides(), large);
+      // Store params in variables to ensure they remain valid
+      const uint8_t* wq_ptr = gpu_ptr<uint8_t>(wq);
+      const uint8_t* scales_ptr = gpu_ptr<uint8_t>(scales);
+      T* w_ptr = gpu_ptr<T>(w);
+      size_t w_size = w.size();
+      void* params[] = {&wq_ptr, &scales_ptr, &w_ptr, &w_size};
       enc.add_kernel_node(
-          kernel,
-          num_blocks,
-          block_dims,
-          0,
-          gpu_ptr<uint8_t>(wq),
-          gpu_ptr<uint8_t>(scales),
-          gpu_ptr<T>(w),
-          w.size());
+          reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, params);
     } else {
       throw std::runtime_error(
           "[Quantize::eval_gpu] Can not dequantize to output with type float64.");

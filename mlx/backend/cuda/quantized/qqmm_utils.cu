@@ -153,17 +153,23 @@ void repack_scales(
   auto [num_blocks, block_dims] = get_launch_args(
       output_size, scales_tiled.shape(), scales_tiled.strides(), large);
 
+  // Store params in variables to ensure they remain valid
+  auto kernel = cu::repack_scales;
+  const uint8_t* scales_ptr = gpu_ptr<uint8_t>(scales);
+  uint8_t* scales_tiled_ptr = gpu_ptr<uint8_t>(scales_tiled);
+  size_t input_rows_val = input_rows;
+  size_t input_cols_val = input_cols;
+  size_t output_rows_val = output_rows;
+  size_t output_cols_val = output_cols;
+  void* params[] = {
+      &scales_ptr,
+      &scales_tiled_ptr,
+      &input_rows_val,
+      &input_cols_val,
+      &output_rows_val,
+      &output_cols_val};
   enc.add_kernel_node(
-      cu::repack_scales,
-      num_blocks,
-      block_dims,
-      0,
-      gpu_ptr<uint8_t>(scales),
-      gpu_ptr<uint8_t>(scales_tiled),
-      input_rows,
-      input_cols,
-      output_rows,
-      output_cols);
+      reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, params);
 }
 
 } // namespace mlx::core

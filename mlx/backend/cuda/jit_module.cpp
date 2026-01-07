@@ -12,7 +12,6 @@
 
 #include <fmt/format.h>
 #include <nvrtc.h>
-#include <unistd.h>
 
 namespace mlx::core::cu {
 

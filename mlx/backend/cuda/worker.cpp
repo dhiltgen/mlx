@@ -3,12 +3,22 @@
 #include "mlx/backend/cuda/worker.h"
 #include "mlx/backend/cuda/device.h"
 
+#include <fmt/format.h>
+
 namespace mlx::core::cu {
 
 Worker::Worker(Device& d)
     : signal_stream_(d),
       signal_event_(d, cudaEventDisableTiming | cudaEventBlockingSync),
-      worker_(&Worker::thread_fn, this) {}
+      worker_(&Worker::thread_fn, this) {
+  // Debug: Check CUDA state after initialization
+  cudaError_t err = cudaPeekAtLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(fmt::format(
+        "Worker: CUDA error during initialization: {}",
+        cudaGetErrorString(err)));
+  }
+}
 
 Worker::~Worker() {
   {

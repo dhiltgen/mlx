@@ -521,3 +521,113 @@ TEST_CASE("test memory info") {
   clear_cache();
   CHECK_EQ(get_cache_memory(), 0);
 }
+
+TEST_CASE("test gpu slice update with non-contiguous source") {
+  // This test reproduces a bug where slice_update fails on CUDA when
+  // the source array is non-contiguous (e.g., after transpose).
+  // The bug manifests as "invalid resource handle" error on CUDA.
+  // See: MLX_CUDA_BUG_REPORT.md
+
+  // First test: contiguous source should work
+  {
+    auto source = ones({8, 2}, bfloat16);
+    eval(source);
+    synchronize();
+
+    auto cache = zeros({8, 10}, bfloat16);
+    eval(cache);
+    synchronize();
+
+    auto updated = slice_update(
+        cache,
+        source,
+        {0, 0}, // start
+        {8, 2}, // stop
+        {1, 1} // stride
+    );
+    eval(updated);
+    synchronize();
+
+    CHECK_EQ(updated.shape(), Shape({8, 10}));
+  }
+
+  // Second test: transposed source (different stride pattern)
+  {
+    // Create source tensor: shape (2, 8)
+    auto source = ones({2, 8}, bfloat16);
+    eval(source);
+    synchronize();
+
+    // Transpose swaps the dimensions and strides
+    auto transposed = transpose(source, {1, 0});
+    eval(transposed);
+    synchronize();
+
+    // Create buffer: shape (8, 10)
+    auto cache = zeros({8, 10}, bfloat16);
+    eval(cache);
+    synchronize();
+
+    // Slice update with non-contiguous source
+    auto updated = slice_update(
+        cache,
+        transposed,
+        {0, 0}, // start
+        {8, 2}, // stop
+        {1, 1} // stride
+    );
+    eval(updated);
+    synchronize();
+
+    // Verify the shape is correct
+    CHECK_EQ(updated.shape(), Shape({8, 10}));
+  }
+
+  // Test with float16 and ndim=4 (collapses to ndim=3)
+  {
+    auto source = ones({1, 2, 8, 128}, float16);
+    auto transposed = transpose(source, {0, 2, 1, 3});
+    eval(transposed);
+
+    auto cache = zeros({1, 8, 256, 128}, float16);
+    eval(cache);
+
+    auto updated = slice_update(
+        cache, transposed, {0, 0, 0, 0}, {1, 8, 2, 128}, {1, 1, 1, 1});
+    eval(updated);
+
+    CHECK_EQ(updated.shape(), Shape({1, 8, 256, 128}));
+  }
+
+  // Test with bfloat16 and ndim=4
+  {
+    auto source = ones({1, 2, 8, 128}, bfloat16);
+    auto transposed = transpose(source, {0, 2, 1, 3});
+    eval(transposed);
+
+    auto cache = zeros({1, 8, 256, 128}, bfloat16);
+    eval(cache);
+
+    auto updated = slice_update(
+        cache, transposed, {0, 0, 0, 0}, {1, 8, 2, 128}, {1, 1, 1, 1});
+    eval(updated);
+
+    CHECK_EQ(updated.shape(), Shape({1, 8, 256, 128}));
+  }
+
+  // Test that float32 works
+  {
+    auto source = ones({1, 2, 8, 128}, float32);
+    auto transposed = transpose(source, {0, 2, 1, 3});
+    eval(transposed);
+
+    auto cache = zeros({1, 8, 256, 128}, float32);
+    eval(cache);
+
+    auto updated = slice_update(
+        cache, transposed, {0, 0, 0, 0}, {1, 8, 2, 128}, {1, 1, 1, 1});
+    eval(updated);
+
+    CHECK_EQ(updated.shape(), Shape({1, 8, 256, 128}));
+  }
+}

@@ -72,8 +72,15 @@ inline fe::DataType_t dtype_to_cudnn_type(Dtype dtype) {
 // There are 2 differences from the const_param util from kernel_utils.cuh:
 // 1. The rest of array is filled with 0.
 // 2. This util can be used in .cpp files.
-template <int NDIM = MAX_NDIM, typename T, template <typename U> class Vec>
-inline std::array<T, NDIM> vector_key(const Vec<T>& vec) {
+//
+// Note: Using typename Vec instead of template-template parameter for MSVC
+// compatibility. MSVC has stricter template deduction rules for
+// template-template parameters with defaulted arguments (like std::vector's
+// allocator).
+template <int NDIM = MAX_NDIM, typename Vec>
+inline auto vector_key(const Vec& vec)
+    -> std::array<typename Vec::value_type, NDIM> {
+  using T = typename Vec::value_type;
   if (vec.size() > NDIM) {
     throw std::runtime_error(
         fmt::format("ndim can not be larger than {}.", NDIM));

@@ -2,6 +2,7 @@
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/cuda/allocator.h"
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/gpu/available.h"
 #include "mlx/primitives.h"
@@ -12,7 +13,9 @@
 namespace mlx::core::gpu {
 
 bool is_available() {
-  return true;
+  // Forward to CUDA backend which handles initialization and kernel
+  // registration
+  return cu::is_available();
 }
 
 void new_stream(Stream s) {

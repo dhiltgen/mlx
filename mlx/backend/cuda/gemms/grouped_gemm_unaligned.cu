@@ -117,11 +117,11 @@ void grouped_gemm_v2(
   dispatch_bool(a_transposed, [&](auto a_transposed_tag) {
     dispatch_bool(b_transposed, [&](auto b_transposed_tag) {
       using LayoutA = std::conditional_t<
-          a_transposed_tag,
+          decltype(a_transposed_tag)::value,
           cutlass::layout::ColumnMajor,
           cutlass::layout::RowMajor>;
       using LayoutB = std::conditional_t<
-          b_transposed_tag,
+          decltype(b_transposed_tag)::value,
           cutlass::layout::ColumnMajor,
           cutlass::layout::RowMajor>;
       using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
@@ -216,37 +216,62 @@ void cutlass_grouped_gemm_unaligned(
   constexpr int N_READS = 4;
   size_t n_threads = cuda::ceil_div(indices.size(), N_READS);
   n_threads = group_count < n_threads ? n_threads : group_count;
-  dim3 block_dims(std::min(n_threads, 1024ul));
+  dim3 block_dims(std::min(n_threads, 1024ull));
   dim3 num_blocks(1);
 
   encoder.set_input_array(indices);
   encoder.set_output_array(gemm_args);
+  auto kernel = cu::prepare_grouped_mm_data<N_READS>;
+  // Store params in variables to ensure they remain valid
+  const uint32_t* indices_ptr = gpu_ptr<uint32_t>(indices);
+  size_t size_val = indices.size();
+  int group_count_val = group_count;
+  int K_val = a.shape(-1);
+  int N_val = b.shape(-1);
+  int lda_val = lda;
+  int ldb_val = ldb;
+  int item_size_val = out.itemsize();
+  int8_t* a_ptr = const_cast<int8_t*>(gpu_ptr<int8_t>(a));
+  int8_t* b_ptr = const_cast<int8_t*>(gpu_ptr<int8_t>(b));
+  int8_t* out_ptr_val = gpu_ptr<int8_t>(out);
+  int a_batch_stride_val = a.shape(-2) * a.shape(-1);
+  int b_batch_stride_val = b.shape(-2) * b.shape(-1);
+  int out_batch_stride_val = out.shape(-2) * out.shape(-1);
+  ProblemSize* problem_sizes_ptr = problem_sizes;
+  int64_t* a_lds_ptr = a_lds;
+  int64_t* b_lds_ptr = b_lds;
+  int64_t* out_lds_ptr = out_lds;
+  void** a_ptrs_ptr = a_ptrs;
+  void** b_ptrs_ptr = b_ptrs;
+  void** out_ptrs_ptr = out_ptrs;
+  void* params[] = {
+      &indices_ptr,
+      &size_val,
+      &group_count_val,
+      &K_val,
+      &N_val,
+      &lda_val,
+      &ldb_val,
+      &item_size_val,
+      &a_ptr,
+      &b_ptr,
+      &out_ptr_val,
+      &a_batch_stride_val,
+      &b_batch_stride_val,
+      &out_batch_stride_val,
+      &problem_sizes_ptr,
+      &a_lds_ptr,
+      &b_lds_ptr,
+      &out_lds_ptr,
+      &a_ptrs_ptr,
+      &b_ptrs_ptr,
+      &out_ptrs_ptr};
   encoder.add_kernel_node(
-      cu::prepare_grouped_mm_data<N_READS>,
+      reinterpret_cast<void*>(kernel),
       num_blocks,
       block_dims,
       group_count * sizeof(uint32_t), // sizeof(cum_histo)
-      gpu_ptr<uint32_t>(indices),
-      indices.size(),
-      group_count,
-      a.shape(-1), // K
-      b.shape(-1), // N,
-      lda,
-      ldb,
-      out.itemsize(),
-      gpu_ptr<int8_t>(a),
-      gpu_ptr<int8_t>(b),
-      gpu_ptr<int8_t>(out),
-      a.shape(-2) * a.shape(-1), // a_batch_stride
-      b.shape(-2) * b.shape(-1), // b_batch_stride
-      out.shape(-2) * out.shape(-1), // out_batch_stride
-      problem_sizes,
-      a_lds,
-      b_lds,
-      out_lds,
-      a_ptrs,
-      b_ptrs,
-      out_ptrs);
+      params);
 
   // Invoke grouped GEMM.
   constexpr int kAlignment = 1;
