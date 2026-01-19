@@ -36,6 +36,7 @@ option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
 option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
 option(MLX_BUILD_CUDA "Build cuda backend" OFF)
+option(MLX_BUILD_OPENCL "Build OpenCL backend" OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
@@ -149,6 +150,17 @@ cmake_policy(SET CMP0135 NEW)
 
 add_library(mlx)
 
+# On Windows, define MLX_STATIC for static library builds to avoid DLL import/export
+if(WIN32 AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(mlx PUBLIC MLX_STATIC)
+endif()
+
+# Supress warnings: note: parameter passing for argument of type
+# 'std::pair<float, float>' when C++17 is enabled changed to match C++14 in GCC
+# 10.1 Only apply -Wno-psabi on GCC/Clang, not MSVC or NVCC
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(mlx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-psabi>)
+endif()
 target_compile_options(mlx PUBLIC ${SANITIZER_COMPILE_FLAGS})
 target_link_options(mlx PUBLIC ${SANITIZER_LINK_FLAGS})
 
@@ -216,6 +228,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(WIN32)
+  # There is no prebuilt OpenBLAS distribution for Windows ARM64.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
+    set(MLX_BUILD_BLAS_FROM_SOURCE ON)
+  endif()
   if(MSVC)
     # GGUF does not build with MSVC.
     set(MLX_BUILD_GGUF OFF)
@@ -259,8 +275,20 @@ if(MLX_BUILD_CPU)
     # so static-linking would require linking with MinGW's runtime.
     FetchContent_Declare(
       openblas
-      URL "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.31/OpenBLAS-0.3.31-x64.zip"
-    )
+      GIT_REPOSITORY https://github.com/OpenMathLib/OpenBLAS.git
+      GIT_TAG v0.3.31
+      EXCLUDE_FROM_ALL
+      PATCH_COMMAND git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/cmake/openblas_windows_arm64.patch" || true)
+    # Save BUILD_SHARED_LIBS before OpenBLAS modifies it (OpenBLAS's CMake
+    # disables BUILD_SHARED_LIBS on MSVC when BUILD_STATIC_LIBS is ON)
+    set(_MLX_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+    set(BUILD_STATIC_LIBS ON) # link statically
+    set(NOFORTRAN ON) # msvc has no fortran compiler
+    # Set TARGET for ARM64 Windows builds
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
+      set(TARGET "ARMV8" CACHE STRING "OpenBLAS target architecture" FORCE)
+      set(BINARY "64" CACHE STRING "OpenBLAS binary bitness" FORCE)
+    endif()
     FetchContent_MakeAvailable(openblas)
     target_link_libraries(mlx
                           PRIVATE "${openblas_SOURCE_DIR}/lib/libopenblas.lib")

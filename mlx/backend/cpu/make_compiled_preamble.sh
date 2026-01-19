@@ -14,6 +14,7 @@ ARCH=$5
 
 if [ "$CLANG" = "TRUE" ]; then
   read -r -d '' INCLUDES <<- EOM
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -21,13 +22,23 @@ if [ "$CLANG" = "TRUE" ]; then
 #ifdef __ARM_FEATURE_FP16_SCALAR_ARITHMETIC
 #include <arm_fp16.h>
 #endif
+#include "mlx/types/half_types.h"
+#include "mlx/types/complex.h"
+#include "mlx/backend/cpu/unary_ops.h"
+#include "mlx/backend/cpu/binary_ops.h"
 EOM
-CC_FLAGS="-arch ${ARCH} -nobuiltininc -nostdinc"
+  # Use -arch only on macOS, not on Windows
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    CC_FLAGS="-arch ${ARCH} -nobuiltininc -nostdinc"
+    CONTENT=$($GCC $CC_FLAGS -I "$SRCDIR" -E -P "$SRCDIR/mlx/backend/cpu/compiled_preamble.h" 2>/dev/null)
+  else
+    # On Windows/Linux, just use direct includes, no preprocessing
+    CONTENT=""
+  fi
 else
 CC_FLAGS="-std=c++17"
-fi
-
 CONTENT=$($GCC $CC_FLAGS -I "$SRCDIR" -E -P "$SRCDIR/mlx/backend/cpu/compiled_preamble.h" 2>/dev/null)
+fi
 
 cat << EOF > "$OUTPUT_FILE"
 const char* get_kernel_preamble() {

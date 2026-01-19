@@ -1,6 +1,9 @@
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   set(COMPILER ${CMAKE_C_COMPILER})
   set(CLANG TRUE)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(COMPILER ${CMAKE_CXX_COMPILER})
+  set(CLANG TRUE)
 else()
   set(COMPILER ${CMAKE_CXX_COMPILER})
 endif()
@@ -37,6 +40,9 @@ add_custom_command(
 add_custom_target(cpu_compiled_preamble DEPENDS compiled_preamble.cpp)
 
 add_dependencies(mlx cpu_compiled_preamble)
+
+# Define MLX_SRC_DIR for JIT compilation include paths
+target_compile_definitions(mlx PRIVATE MLX_SRC_DIR="${PROJECT_SOURCE_DIR}")
 
 target_sources(
   mlx

@@ -108,10 +108,13 @@ std::string JitCompiler::build_command(
       shared_lib_name,
       libpaths);
 #else
+  // Get MLX source directory from compile time
+  const char* mlx_src_dir = MLX_SRC_DIR;
   return fmt::format(
-      "g++ -std=c++17 -O3 -Wall -fPIC -shared \"{0}\" -o \"{1}\" 2>&1",
+      "g++ -std=c++17 -O3 -Wall -fPIC -shared -I\"{2}\" \"{0}\" -o \"{1}\" 2>&1",
       (dir / source_file_name).string(),
-      (dir / shared_lib_name).string());
+      (dir / shared_lib_name).string(),
+      mlx_src_dir);
 #endif
 }
 
