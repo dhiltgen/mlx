@@ -17,8 +17,11 @@ void copy_gpu_inplace(
     CopyType ctype,
     const Stream& s) {
   assert(in.shape() == out.shape());
+  // Convert byte offsets to element offsets
+  int64_t in_offset = static_cast<int64_t>(in.offset()) / in.itemsize();
+  int64_t out_offset = static_cast<int64_t>(out.offset()) / out.itemsize();
   return copy_gpu_inplace(
-      in, out, in.shape(), in.strides(), out.strides(), 0, 0, ctype, s);
+      in, out, in.shape(), in.strides(), out.strides(), in_offset, out_offset, ctype, s);
 }
 
 void copy_gpu_inplace(

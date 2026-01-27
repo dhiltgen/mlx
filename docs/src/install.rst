@@ -181,6 +181,10 @@ should point to the path to the built metal library.
      - OFF
    * - MLX_BUILD_METAL
      - ON
+   * - MLX_BUILD_CUDA
+     - OFF
+   * - MLX_BUILD_OPENCL
+     - OFF
    * - MLX_BUILD_CPU
      - ON
    * - MLX_BUILD_PYTHON_BINDINGS
@@ -282,6 +286,44 @@ To build the C++ package run:
 
    mkdir -p build && cd build
    cmake .. -DMLX_BUILD_CUDA=ON && make -j
+
+
+Windows ARM64 (OpenCL)
+^^^^^^^^^^^^^^^^^^^^^^
+
+MLX has experimental support for Windows on ARM64 devices (e.g., Qualcomm
+Snapdragon X Elite) using an OpenCL backend for GPU acceleration.
+
+Requirements:
+
+- Windows 11 on ARM64
+- Visual Studio 2022 with C++ ARM64 build tools
+- CMake 3.25 or later
+- `Khronos OpenCL SDK <https://github.com/KhronosGroup/OpenCL-SDK>`_ (build and install, or use vcpkg)
+- An OpenCL-capable GPU with drivers installed
+
+To build the C++ library with OpenCL support, point CMake to your OpenCL SDK:
+
+.. code-block:: shell
+
+   mkdir build && cd build
+   cmake .. -A ARM64 -DMLX_BUILD_OPENCL=ON ^
+       -DOpenCL_INCLUDE_DIR=<path-to-opencl-sdk>/include ^
+       -DOpenCL_LIBRARY=<path-to-opencl-sdk>/lib/OpenCL.lib
+   cmake --build . --config Release --parallel 8
+
+To run the tests:
+
+.. code-block:: shell
+
+   .\Release\tests.exe
+
+.. note::
+
+   The OpenCL backend is experimental. Most core operations are supported,
+   but some features may have limited functionality compared to the Metal
+   backend on macOS. Set the environment variable ``MLX_OPENCL_DEBUG=1``
+   for debug logging.
 
 
 Troubleshooting

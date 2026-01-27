@@ -134,13 +134,15 @@ void DynamicSliceUpdate::eval_gpu(
 
   auto out_offset =
       compute_dynamic_offset(start_indices, out.strides(), axes_, s);
+  // Account for source array's data offset when it's a slice
+  int64_t upd_offset = upd.offset() / size_of(upd.dtype());
   copy_gpu_inplace(
       /* const array& src = */ upd,
       /* array& dst = */ out,
       /* const Shape& data_shape = */ upd.shape(),
       /* const Strides& i_strides = */ upd.strides(),
       /* const Strides& o_strides = */ out.strides(),
-      /* int64_t i_offset = */ 0,
+      /* int64_t i_offset = */ upd_offset,
       /* int64_t o_offset = */ 0,
       /* CopyType ctype = */ CopyType::GeneralGeneral,
       /* const Stream& s = */ s,
@@ -239,14 +241,15 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);
 
-  // Do copy
+  // Do copy - account for source array's data offset when it's a slice
+  int64_t upd_offset = upd.offset() / size_of(upd.dtype());
   copy_gpu_inplace(
       /* const array& src = */ upd,
       /* array& dst = */ out,
       /* const Shape& data_shape = */ upd.shape(),
       /* const Strides& i_strides = */ upd.strides(),
       /* const Strides& o_strides = */ out_strides,
-      /* int64_t i_offset = */ 0,
+      /* int64_t i_offset = */ upd_offset,
       /* int64_t o_offset = */ data_offset,
       /* CopyType ctype = */ CopyType::GeneralGeneral,
       /* const Stream& s = */ stream());
