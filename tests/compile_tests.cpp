@@ -816,3 +816,100 @@ TEST_CASE("test compile random bits") {
   auto out = compile(fun)({in})[0];
   CHECK(array_equal(out, expected).item<bool>());
 }
+
+TEST_CASE("test compile bfloat16 operations") {
+  // Test that compiled kernels work correctly with bfloat16 dtype
+
+  // Test unary sigmoid on bfloat16
+  auto sigmoid_fun = [](const std::vector<array>& inputs) {
+    return std::vector<array>{sigmoid(inputs[0])};
+  };
+
+  auto in_bf16 = array({0.0f, 1.0f, -1.0f}, bfloat16);
+  auto expected = sigmoid(in_bf16);
+  eval(expected);
+
+  auto out = compile(sigmoid_fun)({in_bf16})[0];
+  eval(out);
+  CHECK(allclose(out, expected, 1e-2, 1e-2).item<bool>());
+
+  // Test binary multiply on bfloat16
+  auto multiply_fun = [](const std::vector<array>& inputs) {
+    return std::vector<array>{inputs[0] * inputs[1]};
+  };
+
+  auto a_bf16 = array({1.0f, 2.0f, 3.0f}, bfloat16);
+  auto b_bf16 = array({4.0f, 5.0f, 6.0f}, bfloat16);
+  expected = a_bf16 * b_bf16;
+  eval(expected);
+
+  out = compile(multiply_fun)({a_bf16, b_bf16})[0];
+  eval(out);
+  CHECK(allclose(out, expected, 1e-2, 1e-2).item<bool>());
+
+  // Test SwiGLU-like pattern (silu * x) on bfloat16
+  // This is the pattern that caused NaN in LLM inference
+  auto swiglu_fun = [](const std::vector<array>& inputs) {
+    auto silu_out = sigmoid(inputs[0]) * inputs[0];  // silu
+    return std::vector<array>{silu_out * inputs[1]};
+  };
+
+  // Use values similar to what appears in LLM inference
+  auto gate = array({-2.0f, 0.0f, 2.0f, 4.0f}, bfloat16);
+  auto up = array({1.0f, 2.0f, 3.0f, 4.0f}, bfloat16);
+
+  // Compute expected without compile
+  auto gate_silu = sigmoid(gate) * gate;
+  expected = gate_silu * up;
+  eval(expected);
+
+  // Compute with compile
+  out = compile(swiglu_fun)({gate, up})[0];
+  eval(out);
+
+  // Check no NaN
+  CHECK(!any(isnan(out)).item<bool>());
+
+  // Check values match
+  CHECK(allclose(out, expected, 1e-2, 1e-2).item<bool>());
+
+  // Test with larger tensors (like actual LLM dimensions)
+  auto gate_large = random::normal({1, 4, 8192}, bfloat16);
+  auto up_large = random::normal({1, 4, 8192}, bfloat16);
+  eval(gate_large, up_large);
+
+  expected = (sigmoid(gate_large) * gate_large) * up_large;
+  eval(expected);
+
+  out = compile(swiglu_fun)({gate_large, up_large})[0];
+  eval(out);
+
+  CHECK(!any(isnan(out)).item<bool>());
+  CHECK(allclose(out, expected, 1e-2, 1e-2).item<bool>());
+}
+
+TEST_CASE("test compile rsqrt") {
+  // Test that compiled rsqrt works correctly
+  auto rsqrt_fun = [](const std::vector<array>& inputs) {
+    return std::vector<array>{rsqrt(inputs[0])};
+  };
+
+  auto in = array({1.0f, 4.0f, 9.0f, 16.0f});
+  auto expected = rsqrt(in);
+  eval(expected);
+
+  auto out = compile(rsqrt_fun)({in})[0];
+  eval(out);
+
+  CHECK(allclose(out, expected).item<bool>());
+
+  // Test with bfloat16
+  auto in_bf16 = array({1.0f, 4.0f, 9.0f, 16.0f}, bfloat16);
+  expected = rsqrt(in_bf16);
+  eval(expected);
+
+  out = compile(rsqrt_fun)({in_bf16})[0];
+  eval(out);
+
+  CHECK(allclose(out, expected, 1e-2, 1e-2).item<bool>());
+}

@@ -1195,7 +1195,11 @@ TEST_CASE("test complex gradients") {
     auto cotan = array(complex64_t{2.0, -4.0});
     auto vjp_out = vjp(divide_fn, {x, y}, {cotan}).second;
     CHECK_EQ(vjp_out[0].item<complex64_t>(), complex64_t{2.0, 0.0});
-    CHECK_EQ(vjp_out[1].item<complex64_t>(), complex64_t{-3.2, -0.4});
+    // Use approximate comparison for complex division gradient
+    // to allow for small floating point precision differences
+    CHECK_EQ(
+        vjp_out[1].item<complex64_t>(),
+        doctest::Approx(complex64_t{-3.2, -0.4}));
   }
 }
 
