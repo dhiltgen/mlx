@@ -228,18 +228,25 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(WIN32)
-  # There is no prebuilt OpenBLAS distribution for Windows ARM64.
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
-    set(MLX_BUILD_BLAS_FROM_SOURCE ON)
-  endif()
   if(MSVC)
     # GGUF does not build with MSVC.
     set(MLX_BUILD_GGUF OFF)
   endif()
   # Generate DLL and EXE in the same dir, otherwise EXE will not be able to run.
   # This is only done when MLX is built as the top project.
+  # For multi-config generators (MSVC), we need to set per-config output directories
+  # to prevent config-specific subdirectories from being created.
   if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    # For multi-config generators (MSVC, Xcode), override per-config directories
+    foreach(CONFIG_TYPE ${CMAKE_CONFIGURATION_TYPES})
+      string(TOUPPER ${CONFIG_TYPE} CONFIG_TYPE_UPPER)
+      set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${CONFIG_TYPE_UPPER} ${CMAKE_BINARY_DIR})
+      set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${CONFIG_TYPE_UPPER} ${CMAKE_BINARY_DIR})
+      set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${CONFIG_TYPE_UPPER} ${CMAKE_BINARY_DIR})
+    endforeach()
   endif()
   # Windows implementation of dlfcn.h APIs.
   FetchContent_Declare(
@@ -270,36 +277,29 @@ if(MLX_BUILD_CPU)
     add_compile_definitions(MLX_USE_ACCELERATE)
     add_compile_definitions(ACCELERATE_NEW_LAPACK)
   elseif(WIN32)
-    # Download and link prebuilt binaries of OpenBLAS. Note that we can only
-    # link with the dynamic library, the prebuilt binaries were built with MinGW
-    # so static-linking would require linking with MinGW's runtime.
+    # Download prebuilt OpenBLAS binaries for Windows
+    # Building from source with MSVC doesn't work because ARM64 kernels use GNU assembly
+    # Use LP64 (32-bit integer) builds to match MLX's int-based LAPACK calls
+    set(OPENBLAS_VERSION "0.3.31")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
+      set(OPENBLAS_URL "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}-woa64-dll.zip")
+    else()
+      set(OPENBLAS_URL "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}-x64-dll.zip")
+    endif()
     FetchContent_Declare(
       openblas
-      GIT_REPOSITORY https://github.com/OpenMathLib/OpenBLAS.git
-      GIT_TAG v0.3.31
-      EXCLUDE_FROM_ALL
-      PATCH_COMMAND git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/cmake/openblas_windows_arm64.patch" || true)
-    # Save BUILD_SHARED_LIBS before OpenBLAS modifies it (OpenBLAS's CMake
-    # disables BUILD_SHARED_LIBS on MSVC when BUILD_STATIC_LIBS is ON)
-    set(_MLX_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
-    set(BUILD_STATIC_LIBS ON) # link statically
-    set(NOFORTRAN ON) # msvc has no fortran compiler
-    # Set TARGET for ARM64 Windows builds
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
-      set(TARGET "ARMV8" CACHE STRING "OpenBLAS target architecture" FORCE)
-      set(BINARY "64" CACHE STRING "OpenBLAS binary bitness" FORCE)
-    endif()
+      URL ${OPENBLAS_URL}
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(openblas)
-    target_link_libraries(mlx
-                          PRIVATE "${openblas_SOURCE_DIR}/lib/libopenblas.lib")
-    target_include_directories(mlx PRIVATE "${openblas_SOURCE_DIR}/include")
-    # Make sure the DLL file is placed in the same dir with executables.
-    set(OPENBLAS_DLL_FILE "${openblas_SOURCE_DIR}/bin/libopenblas.dll")
+    # LP64 prebuilt package naming (no _64 suffix)
+    target_link_libraries(mlx PRIVATE "${openblas_SOURCE_DIR}/lib/openblas.lib")
+    target_include_directories(mlx PRIVATE "${openblas_SOURCE_DIR}/include/openblas")
+    # Copy DLL to runtime output directory where executables are placed
+    set(OPENBLAS_DLL_FILE "${openblas_SOURCE_DIR}/bin/openblas.dll")
     add_custom_command(
-      TARGET mlx
-      POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENBLAS_DLL_FILE}
-              ${CMAKE_BINARY_DIR})
+      TARGET mlx POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENBLAS_DLL_FILE}" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+      COMMENT "Copying OpenBLAS DLL to output directory")
   else()
     if(${CMAKE_HOST_APPLE})
       # The blas shipped in macOS SDK is not supported, search homebrew for
