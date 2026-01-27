@@ -1614,6 +1614,8 @@ class TestArray(mlx_tests.MLXTestCase):
                 # https://docs.python.org/3.10/library/struct.html#format-characters
                 # numpy returns L/l, as 'long' is equivalent to 'long long' on 64bit machines, so q and l are equivalent
                 # see https://github.com/pybind/pybind11/issues/1908
+                # On Windows (LLP64), 'long' is 32-bit so numpy uses L/l for uint32/int32,
+                # while MLX uses I/i. Both are valid 32-bit representations.
                 if np_dtype == np.uint64:
                     self.assertEqual(mv_mx.format, "Q", f"{mlx_dtype}{np_dtype}")
                 elif np_dtype == np.int64:

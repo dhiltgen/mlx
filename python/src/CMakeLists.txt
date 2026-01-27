@@ -85,6 +85,15 @@ set_target_properties(
 
 target_link_libraries(core PRIVATE mlx)
 
+# On Windows, copy the built module to python/mlx for easy testing
+if(WIN32)
+  add_custom_command(TARGET core POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:core>
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/"
+    COMMENT "Copying core module to python/mlx/")
+endif()
+
 if(BUILD_SHARED_LIBS)
   if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set_target_properties(core PROPERTIES INSTALL_RPATH "@loader_path/lib")
