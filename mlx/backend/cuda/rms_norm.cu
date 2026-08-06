@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
@@ -373,8 +373,20 @@ void dispatch_chunks(int n_chunks, F&& f) {
 }
 
 template <int N_READS, typename F>
-void dispatch_num_chunks(int axis_size, F&& f) {
+void dispatch_num_chunks(int axis_size, bool use_exact_width, F&& f) {
   int nvec = (axis_size + N_READS - 1) / N_READS;
+  if constexpr (N_READS == 8) {
+    if (axis_size <= N_READS * 32) {
+      f(std::integral_constant<int, 32>{}, std::integral_constant<int, 1>{});
+      return;
+    }
+    if (use_exact_width && axis_size == N_READS * 352) {
+      // At width 2816, one exact-width block is faster than three 128-thread
+      // reduction chunks on SM120 and SM121.
+      f(std::integral_constant<int, 352>{}, std::integral_constant<int, 1>{});
+      return;
+    }
+  }
   if (axis_size <= N_READS * 64) {
     f(std::integral_constant<int, 64>{}, std::integral_constant<int, 1>{});
   } else if (nvec % 128 == 0 && nvec / 128 <= 8) {
@@ -434,37 +446,43 @@ void RMSNorm::eval_gpu(
     using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
     if (axis_size <= N_READS * 128 * 8) {
-      dispatch_num_chunks<
-          N_READS>(axis_size, [&](auto block_size, auto n_chunks) {
-        constexpr int BLOCK_SIZE = block_size();
-        constexpr int N_CHUNKS = n_chunks();
-        bool aligned = (axis_size == N_READS * BLOCK_SIZE * N_CHUNKS) &&
-            (w_stride == 1) &&
-            (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(x)) % 16 == 0) &&
-            (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(w)) % 16 == 0) &&
-            (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(out)) % 16 == 0);
-        // MSVC can't find N_READS two lambda levels down, dispatch_bool would
-        // add that second level
-        auto kernel = aligned
-            ? cu::rms_norm_small<DataType, BLOCK_SIZE, N_CHUNKS, true, N_READS>
-            : cu::rms_norm_small<
-                  DataType,
-                  BLOCK_SIZE,
-                  N_CHUNKS,
-                  false,
-                  N_READS>;
-        encoder.add_kernel_node(
-            kernel,
-            n_rows,
-            BLOCK_SIZE,
-            gpu_ptr<DataType>(x),
-            gpu_ptr<DataType>(w),
-            gpu_ptr<DataType>(out),
-            eps_,
-            axis_size,
-            n_rows,
-            w_stride);
-      });
+      dispatch_num_chunks<N_READS>(
+          axis_size,
+          encoder.device().compute_capability_major() == 12,
+          [&](auto block_size, auto n_chunks) {
+            constexpr int BLOCK_SIZE = block_size();
+            constexpr int N_CHUNKS = n_chunks();
+            bool aligned = (axis_size == N_READS * BLOCK_SIZE * N_CHUNKS) &&
+                (w_stride == 1) &&
+                (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(x)) % 16 == 0) &&
+                (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(w)) % 16 == 0) &&
+                (reinterpret_cast<uintptr_t>(gpu_ptr<DataType>(out)) % 16 == 0);
+            // MSVC can't find N_READS two lambda levels down, dispatch_bool
+            // would add that second level
+            auto kernel = aligned ? cu::rms_norm_small<
+                                        DataType,
+                                        BLOCK_SIZE,
+                                        N_CHUNKS,
+                                        true,
+                                        N_READS>
+                                  : cu::rms_norm_small<
+                                        DataType,
+                                        BLOCK_SIZE,
+                                        N_CHUNKS,
+                                        false,
+                                        N_READS>;
+            encoder.add_kernel_node(
+                kernel,
+                n_rows,
+                BLOCK_SIZE,
+                gpu_ptr<DataType>(x),
+                gpu_ptr<DataType>(w),
+                gpu_ptr<DataType>(out),
+                eps_,
+                axis_size,
+                n_rows,
+                w_stride);
+          });
     } else {
       auto kernel = cu::rms_norm<DataType, 1024, N_READS>;
       encoder.add_kernel_node(

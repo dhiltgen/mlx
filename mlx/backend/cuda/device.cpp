@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/worker.h"
@@ -52,6 +52,8 @@ Device::Device(int device) : device_(device) {
       &managed_memory_, cudaDevAttrManagedMemory, device_));
   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
       &memory_pools_, cudaDevAttrMemoryPoolsSupported, device_));
+  CHECK_CUDA_ERROR(
+      cudaDeviceGetAttribute(&integrated_, cudaDevAttrIntegrated, device_));
 }
 
 Device::~Device() = default;
@@ -190,11 +192,14 @@ std::pair<int, int> get_graph_limits(Device& d) {
       break;
     case 900: // H100
     case 1000: // B200
-    case 1200: // Consumer Blackwell
       ops = 100;
       mb = 1000;
       break;
-    case 1210: // DGX Spark
+    case 1200: // Consumer Blackwell
+      ops = 800;
+      mb = 8000;
+      break;
+    case 1210: // SM121 Blackwell
       ops = 20;
       mb = 25;
       break;
@@ -202,13 +207,33 @@ std::pair<int, int> get_graph_limits(Device& d) {
   return {env::max_ops_per_buffer(ops), env::max_mb_per_buffer(mb)};
 }
 
+// SM121 prefill produces enough graph topologies to evict hot decode graphs
+// from the default cache; 800 entries kept both resident in endpoint tests.
 CommandEncoder::CommandEncoder(Device& d)
     : device_(d),
       stream_(d),
       graph_(d),
       worker_(std::make_shared<Worker>(d)),
-      graph_cache_("MLX_CUDA_GRAPH_CACHE_SIZE", /* default_capacity */ 400) {
+      graph_cache_(
+          "MLX_CUDA_GRAPH_CACHE_SIZE",
+          d.compute_capability_major() == 12 &&
+                  d.compute_capability_minor() == 1
+              ? 800
+              : 400) {
   std::tie(max_ops_per_graph_, max_mb_per_graph_) = get_graph_limits(d);
+  max_small_batch_ops_per_graph_ = max_ops_per_graph_;
+  max_small_batch_mb_per_graph_ = max_mb_per_graph_;
+
+  auto cc =
+      d.compute_capability_major() * 100 + d.compute_capability_minor() * 10;
+  adaptive_graph_limits_ = cc == 1210;
+  if (cc == 1210) {
+    // Small-batch graphs need enough work to amortize SM121 launch costs,
+    // while prefill keeps the conservative defaults to bound graph memory.
+    max_small_batch_ops_per_graph_ =
+        env::get_var("MLX_MAX_OPS_PER_BUFFER", 400);
+    max_small_batch_mb_per_graph_ = env::get_var("MLX_MAX_MB_PER_BUFFER", 512);
+  }
   worker_->start();
 }
 
@@ -238,6 +263,19 @@ void CommandEncoder::set_output_array(const array& arr) {
   auto id = reinterpret_cast<std::uintptr_t>(arr.buffer().ptr());
   active_deps_.push_back(id);
   active_outputs_.push_back(id);
+
+  // Wide 2D/3D outputs identify model activations. The 64-row threshold
+  // separates prefill from the small decode batches in the tuned workloads;
+  // higher-rank recurrent states and narrow metadata are not batch evidence.
+  if (adaptive_graph_limits_ && arr.ndim() > 0 && arr.ndim() <= 3 &&
+      arr.shape(-1) >= 256) {
+    auto rows = arr.size() / arr.shape(-1);
+    if (rows > 64) {
+      has_large_batch_output_ = true;
+    } else {
+      has_small_batch_activation_ = true;
+    }
+  }
 }
 
 void CommandEncoder::add_kernel_node_raw(
@@ -456,8 +494,12 @@ void CommandEncoder::add_graph_node(
 }
 
 bool CommandEncoder::needs_commit() {
-  return (node_count_ > max_ops_per_graph_) ||
-      ((bytes_in_graph_ >> 20) > max_mb_per_graph_);
+  bool small_batch = adaptive_graph_limits_ && has_small_batch_activation_ &&
+      !has_large_batch_output_;
+  int max_ops =
+      small_batch ? max_small_batch_ops_per_graph_ : max_ops_per_graph_;
+  int max_mb = small_batch ? max_small_batch_mb_per_graph_ : max_mb_per_graph_;
+  return (node_count_ > max_ops) || ((bytes_in_graph_ >> 20) > max_mb);
 }
 
 void CommandEncoder::commit() {
@@ -533,6 +575,8 @@ void CommandEncoder::commit() {
   worker_->commit(stream_);
   node_count_ = 0;
   bytes_in_graph_ = 0;
+  has_large_batch_output_ = false;
+  has_small_batch_activation_ = false;
 }
 
 void CommandEncoder::synchronize() {

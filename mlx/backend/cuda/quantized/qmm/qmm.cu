@@ -77,7 +77,8 @@ bool supports_qmm_sm80(
   }
   int n = out.shape(-1);
   int k = x.shape(-1);
-  if ((n % 128 != 0) || (k % std::max(64, group_size) != 0)) {
+  if ((n < 128) || ((n % 128 != 0) && mode == QuantizationMode::Affine) ||
+      (k % std::max(64, group_size) != 0)) {
     return false;
   }
   if (!is_last_2_dims_row_contiguous(w) ||
@@ -154,6 +155,45 @@ bool supports_fp_qmv(
     return false;
   }
   return true;
+}
+
+bool supports_fp_gather_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::Device& device) {
+  if (!supports_fp_qmv(
+          x,
+          w,
+          scales,
+          biases,
+          out,
+          transpose,
+          bits,
+          group_size,
+          mode,
+          device)) {
+    return false;
+  }
+  int m = out.ndim() > 1 ? out.shape(-2) : 1;
+  int k = x.shape(-1);
+  int vec_batch = x.size() / k;
+  if (m > 8 || vec_batch < m) {
+    return false;
+  }
+  if (w.ndim() < 3) {
+    return false;
+  }
+  int rows = out.shape(-1);
+  int cols = x.shape(-1);
+  int experts = w.size() / (w.shape(-1) * w.shape(-2));
+  return experts > 0 && rows == w.shape(-2) && cols == w.shape(-1) * 32 / bits;
 }
 
 bool supports_qmv(

@@ -151,6 +151,10 @@ device_info_impl(int device_index) {
       dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
       dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
 
+      // Integrated GPUs (Jetson/GB10/N1x) share system RAM with the GPU but
+      // have a much smaller CUDA device-pool ceiling than total memory.
+      dev.info["integrated"] = static_cast<size_t>(prop.integrated);
+
       devices.push_back(std::move(dev));
     }
     return devices;

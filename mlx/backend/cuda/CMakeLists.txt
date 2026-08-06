@@ -189,11 +189,21 @@ if(WIN32)
     target_sources(
       mlx PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/delayload.cpp>)
   endif()
+  # Ninja cross-builds can retain the x64 host system processor even when MSVC
+  # is targeting ARM64, so prefer the compiler's detected architecture.
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(ARM64|arm64|aarch64)$"
+     OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+    set(MLX_CUDA_WINDOWS_ARCH "arm64")
+  else()
+    set(MLX_CUDA_WINDOWS_ARCH "x64")
+  endif()
+  set(MLX_CUDA_WINDOWS_BIN_DIR
+      "${CUDAToolkit_BIN_DIR}/${MLX_CUDA_WINDOWS_ARCH}")
   # Get all the CUDA DLLs we could link with.
   file(
     GLOB CUDA_DLL_NAMES
-    RELATIVE "${CUDAToolkit_BIN_DIR}/x64"
-    "${CUDAToolkit_BIN_DIR}/x64/*.dll")
+    RELATIVE "${MLX_CUDA_WINDOWS_BIN_DIR}"
+    "${MLX_CUDA_WINDOWS_BIN_DIR}/*.dll")
   # Delay load CUDA and cuDNN libs.
   foreach(CUDA_DLL ${CUDA_DLL_NAMES} ${CUDNN_DLL_NAMES})
     target_link_options(mlx PUBLIC "/DELAYLOAD:${CUDA_DLL}")
@@ -201,7 +211,7 @@ if(WIN32)
   # Pass the locations where CUDA DLLs are placed.
   if(NOT MLX_LOAD_CUDA_LIBS_FROM_PYTHON)
     target_compile_definitions(
-      mlx_dirs PRIVATE MLX_CUDA_BIN_DIR="${CUDAToolkit_BIN_DIR}/x64"
+      mlx_dirs PRIVATE MLX_CUDA_BIN_DIR="${MLX_CUDA_WINDOWS_BIN_DIR}"
                        MLX_CUDNN_BIN_DIR="${CUDNN_BIN_DIR}")
   endif()
 else()

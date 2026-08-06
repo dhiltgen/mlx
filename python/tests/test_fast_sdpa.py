@@ -248,6 +248,69 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
 
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_sdpa_wide_head_dims(self):
+        mx.random.seed(0)
+        for dtype, tol in [
+            (mx.float32, 5e-4),
+            (mx.float16, 2e-3),
+            (mx.bfloat16, 2e-2),
+        ]:
+            for D in [256, 512]:
+                array_mask = mx.where(mx.arange(43) % 7, 0.0, -10.0).astype(dtype)[
+                    None, None, None
+                ]
+                for qL, kL, mask in [
+                    (1, 1050, None),
+                    (8, 43, "causal"),
+                    (8, 43, array_mask),
+                ]:
+                    with self.subTest(dtype=dtype, D=D, qL=qL, kL=kL, mask=mask):
+                        q = mx.random.normal(shape=(1, 4, qL, D), dtype=dtype)
+                        k = mx.random.normal(shape=(1, 1, kL, D), dtype=dtype)
+                        v = mx.random.normal(shape=(1, 1, kL, D), dtype=dtype)
+                        expected = mlx_primitives_sdpa(q, k, v, D**-0.5, mask=mask)
+                        actual = mx.fast.scaled_dot_product_attention(
+                            q, k, v, scale=D**-0.5, mask=mask
+                        )
+                        self.assertTrue(
+                            mx.allclose(expected, actual, atol=tol, rtol=tol)
+                        )
+
+        for kL in [43, 1050]:
+            with self.subTest(mask="nan", kL=kL):
+                q = mx.ones((1, 4, 1, 256))
+                k = mx.ones((1, 1, kL, 256))
+                v = mx.ones((1, 1, kL, 256))
+                mask = mx.concatenate(
+                    [
+                        mx.full((1, 1, 1, 1), float("nan")),
+                        mx.zeros((1, 1, 1, kL - 1)),
+                    ],
+                    axis=-1,
+                )
+                expected = mlx_primitives_sdpa(q, k, v, 256**-0.5, mask=mask)
+                actual = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=256**-0.5, mask=mask
+                )
+                self.assertTrue(mx.all(mx.isnan(expected)))
+                self.assertTrue(mx.all(mx.isnan(actual)))
+
+        # Force all five optional input copies (q, k, v, mask, and sinks).
+        # This guards the vector path's temporary storage against reference
+        # invalidation when the final copy grows its backing vector.
+        D, qH, kL = 256, 4, 43
+        q = mx.random.normal(shape=(1, qH, 1, D, 2), dtype=mx.float16)[..., 0]
+        k = mx.random.normal(shape=(1, 1, kL, D, 2), dtype=mx.float16)[..., 0]
+        v = mx.random.normal(shape=(1, 1, kL, D, 2), dtype=mx.float16)[..., 0]
+        mask = mx.random.normal(shape=(1, 1, 1, kL, 2), dtype=mx.float16)[..., 0]
+        sinks = mx.random.normal(shape=(qH * 2,), dtype=mx.float16)[::2]
+        expected = mlx_ref_attn(q, k, v, D**-0.5, mask=mask, sinks=sinks)
+        actual = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=D**-0.5, mask=mask, sinks=sinks
+        )
+        self.assertTrue(mx.allclose(expected, actual, atol=2e-2, rtol=2e-2))
+
     def test_sdpa_fully_masked(self):
         Lkv = 8
         mask = mx.array(False)

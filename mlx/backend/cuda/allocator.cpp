@@ -52,10 +52,13 @@ bool supports_managed_memory() {
   return managed_memory;
 }
 
+inline void advise_accessed_by_all_devices(void* data, size_t size);
+
 inline void* unified_malloc(size_t size) {
   void* data = nullptr;
   if (supports_managed_memory()) {
     CHECK_CUDA_ERROR(cudaMallocManaged(&data, size));
+    advise_accessed_by_all_devices(data, size);
   } else {
     CHECK_CUDA_ERROR(cudaMallocHost(&data, size));
   }
@@ -82,6 +85,23 @@ inline int cuda_mem_loc(int i) {
   return i;
 }
 #endif // CUDART_VERSION >= 13000
+
+// Mark managed allocations as accessed-by all hardware-coherent devices so
+// the driver tracks usage and keeps pages GPU-resident when hot, instead of
+// blind interconnect reads on every access (full unified memory systems only).
+inline void advise_accessed_by_all_devices(void* data, size_t size) {
+  if (!supports_managed_memory()) {
+    return;
+  }
+  int device_count = gpu::device_count();
+  for (int i = 0; i < device_count; ++i) {
+    if (device(i).concurrent_managed_access()) {
+      auto loc = cuda_mem_loc(i);
+      CHECK_CUDA_ERROR(
+          cudaMemAdvise(data, size, cudaMemAdviseSetAccessedBy, loc));
+    }
+  }
+}
 
 SmallSizePool::SmallSizePool() {
   auto num_blocks = small_pool_size / small_block_size;
@@ -213,7 +233,9 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
         msg << "[malloc] Unable to allocate " << size << " bytes.";
         throw std::runtime_error(msg.str());
       }
-      buf = new CudaBuffer{data, size, device};
+      if (!buf) {
+        buf = new CudaBuffer{data, size, device};
+      }
     }
     lock.lock();
 
