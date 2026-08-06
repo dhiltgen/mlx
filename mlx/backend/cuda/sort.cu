@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include <algorithm>
 #include <cassert>
@@ -720,6 +720,7 @@ __global__ void mb_block_merge_kernel(
 
 namespace {
 
+template <int TN>
 void single_block_sort(
     const Stream& s,
     const array& in,
@@ -774,12 +775,8 @@ void single_block_sort(
           using OutT = std::conditional_t<ARG_SORT, uint32_t, ValT>;
 
           if (contiguous) {
-            auto kernel = cu::block_sort_kernel<
-                ValT,
-                OutT,
-                ARG_SORT,
-                BLOCK_THREADS,
-                N_PER_THREAD>;
+            auto kernel =
+                cu::block_sort_kernel<ValT, OutT, ARG_SORT, BLOCK_THREADS, TN>;
             int64_t in_stride_segment_axis = INT64_MAX;
             int64_t out_stride_segment_axis = INT64_MAX;
             for (int i = 0; i < nc_shape.size(); i++) {
@@ -806,12 +803,8 @@ void single_block_sort(
                 in_stride_segment_axis,
                 out_stride_segment_axis);
           } else {
-            auto kernel = cu::block_sort_nc_kernel<
-                ValT,
-                OutT,
-                ARG_SORT,
-                BLOCK_THREADS,
-                N_PER_THREAD>;
+            auto kernel = cu::
+                block_sort_nc_kernel<ValT, OutT, ARG_SORT, BLOCK_THREADS, TN>;
             auto nc_shape_param = const_param(nc_shape);
             auto in_nc_strides_param = const_param(in_nc_str);
             auto out_nc_strides_param = const_param(out_nc_str);
@@ -1011,6 +1004,10 @@ void gpu_merge_sort(
   int axis = axis_ < 0 ? axis_ + in.ndim() : axis_;
   int size_sorted_axis = in.shape(axis);
 
+  if (size_sorted_axis <= 128) {
+    return single_block_sort<4>(s, in, out, axis, 32, argsort);
+  }
+
   constexpr int tn = N_PER_THREAD;
   int potential_bn = (size_sorted_axis + tn - 1) / tn;
 
@@ -1037,7 +1034,7 @@ void gpu_merge_sort(
   if (n_blocks > 1) {
     return multi_block_sort(s, in, out, axis, n_blocks, argsort);
   }
-  return single_block_sort(s, in, out, axis, bn, argsort);
+  return single_block_sort<N_PER_THREAD>(s, in, out, axis, bn, argsort);
 }
 
 void gpu_sort(

@@ -1403,6 +1403,64 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertTrue(mx.allclose(y1, y3, atol=tol))
                 self.assertTrue(mx.allclose(y1, y4, atol=tol))
 
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_gather_qmm_sorted_cuda_async_pipeline(self):
+        rows, n, k = 8192, 2816, 704
+        x = mx.random.normal((rows, 1, 1, k)).astype(mx.bfloat16)
+        w = mx.random.normal((1, n, k)).astype(mx.bfloat16)
+        qw, scales = mx.quantize(w, mode="mxfp8")
+        indices = mx.zeros((rows, 1), dtype=mx.uint32)
+        reference = mx.gather_qmm(
+            x,
+            qw,
+            scales,
+            rhs_indices=indices,
+            transpose=True,
+            mode="mxfp8",
+        )
+        mx.eval(reference)
+
+        # A pending cp.async write used to race with shared-memory reuse in
+        # the sorted epilogue, corrupting a small, nondeterministic row set.
+        for _ in range(5):
+            candidate = mx.gather_qmm(
+                x,
+                qw,
+                scales,
+                rhs_indices=indices,
+                transpose=True,
+                mode="mxfp8",
+                sorted_indices=True,
+            )
+            mx.eval(candidate)
+            self.assertEqual(mx.max(mx.abs(reference - candidate)).item(), 0)
+
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_gather_qmm_fp_decode_cuda(self):
+        rows, experts, n, k = 8, 2, 544, 512
+        x = (mx.random.normal((rows, 1, 1, k)) / k**0.5).astype(mx.bfloat16)
+        w = (mx.random.normal((experts, n, k)) / k**0.5).astype(mx.bfloat16)
+        indices = mx.array([[0], [0], [0], [0], [1], [1], [1], [1]], dtype=mx.uint32)
+
+        for mode in ["nvfp4", "mxfp8"]:
+            with self.subTest(mode=mode):
+                qw, scales = mx.quantize(w, mode=mode)
+                w_hat = mx.dequantize(qw, scales, mode=mode)
+                expected = mx.gather_mm(
+                    x,
+                    w_hat.swapaxes(-1, -2),
+                    rhs_indices=indices,
+                )
+                actual = mx.gather_qmm(
+                    x,
+                    qw,
+                    scales,
+                    rhs_indices=indices,
+                    transpose=True,
+                    mode=mode,
+                )
+                self.assertLess(mx.max(mx.abs(expected - actual)).item(), 1e-3)
+
     def test_gather_qmm_grad(self):
         def gather_qmm_ref(x, w, s, b, lhs, rhs, trans, sort):
             if lhs is not None:

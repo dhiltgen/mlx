@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
@@ -11,6 +11,17 @@
 #include <nvtx3/nvtx3.hpp>
 
 namespace mlx::core {
+
+namespace {
+
+bool prefer_qmv(const cu::Device& device, int batch_rows) {
+  // On SM120 and SM121, tensor-core QMM setup does not amortize at eight rows;
+  // the vector kernel remains faster through that boundary.
+  return batch_rows < 8 ||
+      (device.compute_capability_major() == 12 && batch_rows <= 8);
+}
+
+} // namespace
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
@@ -102,6 +113,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int K = x.shape(-1);
   int B = out.size() / (M * N);
+  bool use_qmv = prefer_qmv(encoder.device(), M * B);
 
   if (can_use_qmm_sm90) {
     if (can_use_qmv && (M == 1 && B == 1 && N <= 16384 && K <= 16384)) {
@@ -113,7 +125,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (can_use_qmm_sm80) {
-    if (can_use_qmv && (M * B < 8)) {
+    if (can_use_qmv && use_qmv) {
       call_qmv();
     } else {
       call_qmm_sm80();
@@ -122,7 +134,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (can_use_qmm_naive) {
-    if (can_use_qmv && (M * B < 8)) {
+    if (can_use_qmv && use_qmv) {
       call_qmv();
     } else {
       call_qmm_naive();
@@ -186,9 +198,15 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder.device());
   };
+  bool fp_mode = mode_ != QuantizationMode::Affine;
   bool can_use_qmm_sm80 = supports(supports_qmm_sm80);
   bool can_use_qmm_naive = supports(supports_qmm_naive);
-  bool can_use_qmv = supports(supports_qmv);
+  // right_sorted_ is set only when lhs_indices was omitted, so x rows are
+  // already in output order and this path only needs to gather the RHS.
+  bool can_use_gather_qmm_rhs_sm80 =
+      fp_mode && right_sorted_ && supports(supports_gather_qmm_rhs_sm80);
+  bool can_use_fp_gather_qmv = supports(supports_fp_gather_qmv);
+  bool can_use_qmv = supports(supports_qmv) || can_use_fp_gather_qmv;
 
   auto call_qmm_sm80 = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
@@ -222,14 +240,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
-  auto call_qmv = [&]() {
+  auto call_gather_qmm_rhs_sm80 = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
-    gather_qmv(
+    gather_qmm_rhs_sm80(
         x,
         w,
         scales,
         biases,
-        lhs_indices,
         rhs_indices,
         out,
         bits_,
@@ -237,9 +254,44 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
+  auto call_qmv = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    if (can_use_fp_gather_qmv) {
+      fp_gather_qmv(
+          x,
+          w,
+          scales,
+          lhs_indices,
+          rhs_indices,
+          out,
+          bits_,
+          group_size_,
+          encoder,
+          s);
+    } else {
+      gather_qmv(
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          out,
+          bits_,
+          group_size_,
+          mode_,
+          encoder);
+    }
+  };
+
+  if (can_use_gather_qmm_rhs_sm80) {
+    call_gather_qmm_rhs_sm80();
+    return;
+  }
+  bool use_qmv = prefer_qmv(encoder.device(), M * B);
 
   if (can_use_qmm_sm80) {
-    if (can_use_qmv && (M * B < 8)) {
+    if (can_use_qmv && use_qmv) {
       call_qmv();
     } else {
       call_qmm_sm80();
@@ -248,7 +300,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (can_use_qmm_naive) {
-    if (can_use_qmv && (M * B < 8)) {
+    if (can_use_qmv && use_qmv) {
       call_qmv();
     } else {
       call_qmm_naive();

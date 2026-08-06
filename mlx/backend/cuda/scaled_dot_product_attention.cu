@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 // Required for using M_LOG2E in MSVC.
 #define _USE_MATH_DEFINES
@@ -30,12 +30,14 @@ struct AttnParams {
   int kL;
 
   int gqa_factor;
+  int maskH;
   float scale;
 
   int64_t Q_strides[3];
   int64_t K_strides[3];
   int64_t V_strides[3];
   int64_t O_strides[3];
+  int64_t M_strides[4];
 };
 
 template <typename T, bool do_causal, int D>
@@ -44,6 +46,7 @@ __global__ void kernel_sdpav_1pass(
     const T* K,
     const T* V,
     T* O,
+    const T* M,
     const T* sinks,
     __grid_constant__ const AttnParams params) {
   constexpr int BN = 32;
@@ -96,6 +99,12 @@ __global__ void kernel_sdpav_1pass(
       head_idx * params.O_strides[1] + // Head
       q_seq_idx * params.O_strides[2]; // Sequence
 
+  if (M) {
+    M += batch_idx * params.M_strides[0] + // Batch
+        (params.maskH == 1 ? 0 : head_idx * params.M_strides[1]) + // Head
+        q_seq_idx * params.M_strides[2]; // Sequence
+  }
+
   // Read the query and 0 the output accumulator
   PRAGMA_LOOP_UNROLL
   for (int i = 0; i < v_per_thread; i++) {
@@ -121,6 +130,11 @@ __global__ void kernel_sdpav_1pass(
       use_key = i <= (params.kL - params.qL + q_seq_idx);
     }
 
+    U bias = 0.f;
+    if (M) {
+      bias = static_cast<U>(M[i * params.M_strides[3]]) * M_LOG2E;
+      use_key = use_key && (bias >= Limits<U>::finite_min() || isnan(bias));
+    }
     if (use_key) {
       // Read the key
       PRAGMA_LOOP_UNROLL
@@ -139,6 +153,7 @@ __global__ void kernel_sdpav_1pass(
       score = cg::reduce(warp, score, cg::plus<U>());
 
       // Update the accumulators
+      score += bias;
       U new_max = max(max_score, score);
       U factor = exp2f(max_score - new_max);
       U exp_score = exp2f(score - new_max);
@@ -196,6 +211,7 @@ __global__ void kernel_sdpav_2pass_1(
     const T* Q,
     const T* K,
     const T* V,
+    const T* M,
     const T* sinks,
     float* partials,
     float* sums,
@@ -249,6 +265,12 @@ __global__ void kernel_sdpav_2pass_1(
       kv_head_idx * params.V_strides[1] + // Head
       kv_seq_idx * params.V_strides[2]; // Sequence
 
+  if (M) {
+    M += batch_idx * params.M_strides[0] + // Batch
+        (params.maskH == 1 ? 0 : head_idx * params.M_strides[1]) + // Head
+        q_seq_idx * params.M_strides[2]; // Sequence
+  }
+
   const int p_stride_s = blocks;
   const int p_stride_h = params.qL * p_stride_s;
   const int p_stride_b = params.H * p_stride_h;
@@ -262,9 +284,18 @@ __global__ void kernel_sdpav_2pass_1(
   maxs += p_offset;
 
   // Read the query and 0 the output accumulator
-  PRAGMA_LOOP_UNROLL
-  for (int i = 0; i < v_per_thread; i++) {
-    q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
+  if constexpr (sizeof(T) == 2 && (D == 256 || D == 512)) {
+    auto q_vec =
+        unsafe_load_vector<v_per_thread>(Q + v_per_thread * lane_idx, 0);
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      q[i] = scale_log2 * static_cast<U>(q_vec[i]);
+    }
+  } else {
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
+    }
   }
 
   PRAGMA_LOOP_UNROLL
@@ -286,11 +317,25 @@ __global__ void kernel_sdpav_2pass_1(
       use_key = i <= (params.kL - params.qL + q_seq_idx);
     }
 
+    U bias = 0.f;
+    if (M) {
+      bias = static_cast<U>(M[i * params.M_strides[3]]) * M_LOG2E;
+      use_key = use_key && (bias >= Limits<U>::finite_min() || isnan(bias));
+    }
     if (use_key) {
       // Read the key
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        k[j] = K[v_per_thread * lane_idx + j];
+      if constexpr (sizeof(T) == 2 && (D == 256 || D == 512)) {
+        auto k_vec =
+            unsafe_load_vector<v_per_thread>(K + v_per_thread * lane_idx, 0);
+        PRAGMA_LOOP_UNROLL
+        for (int j = 0; j < v_per_thread; j++) {
+          k[j] = k_vec[j];
+        }
+      } else {
+        PRAGMA_LOOP_UNROLL
+        for (int j = 0; j < v_per_thread; j++) {
+          k[j] = K[v_per_thread * lane_idx + j];
+        }
       }
 
       // Compute the i-th score
@@ -304,6 +349,7 @@ __global__ void kernel_sdpav_2pass_1(
       score = cg::reduce(warp, score, cg::plus<U>());
 
       // Update the accumulators
+      score += bias;
       U new_max = max(max_score, score);
       U factor = exp2f(max_score - new_max);
       U exp_score = exp2f(score - new_max);
@@ -312,10 +358,19 @@ __global__ void kernel_sdpav_2pass_1(
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      PRAGMA_LOOP_UNROLL
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor +
-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
+      if constexpr (sizeof(T) == 2 && (D == 256 || D == 512)) {
+        auto v_vec =
+            unsafe_load_vector<v_per_thread>(V + v_per_thread * lane_idx, 0);
+        PRAGMA_LOOP_UNROLL
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * static_cast<U>(v_vec[j]);
+        }
+      } else {
+        PRAGMA_LOOP_UNROLL
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor +
+              exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
+        }
       }
     }
 
@@ -363,9 +418,19 @@ __global__ void kernel_sdpav_2pass_1(
   }
 
   if (warp_idx == 0) {
-    PRAGMA_LOOP_UNROLL
-    for (int i = 0; i < v_per_thread; i++) {
-      partials[v_per_thread * lane_idx + i] = o[i];
+    if constexpr (D == 256 || D == 512) {
+      AlignedVector<U, v_per_thread> o_vec;
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < v_per_thread; i++) {
+        o_vec[i] = o[i];
+      }
+      unsafe_store_vector<v_per_thread>(
+          partials + v_per_thread * lane_idx, 0, o_vec);
+    } else {
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < v_per_thread; i++) {
+        partials[v_per_thread * lane_idx + i] = o[i];
+      }
     }
   }
 }
@@ -420,9 +485,18 @@ __global__ void kernel_sdpav_2pass_2(
   U sum_exp_score = cg::reduce(warp, sums[lane_idx] * factor, cg::plus<U>());
   sum_exp_score = sum_exp_score == 0 ? 0 : __frcp_rn(sum_exp_score);
 
-  PRAGMA_LOOP_UNROLL
-  for (int i = 0; i < v_per_thread; i++) {
-    o[i] = partials[v_per_thread * lane_idx + i];
+  if constexpr (D == 256 || D == 512) {
+    auto o_vec =
+        unsafe_load_vector<v_per_thread>(partials + v_per_thread * lane_idx, 0);
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = o_vec[i];
+    }
+  } else {
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = partials[v_per_thread * lane_idx + i];
+    }
   }
 
   // Now we need to aggregate all the outputs
@@ -437,9 +511,18 @@ __global__ void kernel_sdpav_2pass_2(
 
   // And write the output
   if (lane_idx == 0) {
-    PRAGMA_LOOP_UNROLL
-    for (int i = 0; i < v_per_thread; i++) {
-      O[v_per_thread * warp_idx + i] = static_cast<T>(o[i]);
+    if constexpr (sizeof(T) == 2 && (D == 256 || D == 512)) {
+      AlignedVector<T, v_per_thread> o_vec;
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < v_per_thread; i++) {
+        o_vec[i] = static_cast<T>(o[i]);
+      }
+      unsafe_store_vector<v_per_thread>(O + v_per_thread * warp_idx, 0, o_vec);
+    } else {
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < v_per_thread; i++) {
+        O[v_per_thread * warp_idx + i] = static_cast<T>(o[i]);
+      }
     }
   }
 }
@@ -460,6 +543,12 @@ void dispatch_headdim(int n, F&& f) {
     case 128:
       f(std::integral_constant<int, 128>{});
       break;
+    case 256:
+      f(std::integral_constant<int, 256>{});
+      break;
+    case 512:
+      f(std::integral_constant<int, 512>{});
+      break;
   }
 }
 
@@ -472,12 +561,16 @@ void sdpa_vector_1pass_fallback(
     const float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask_arr,
     const std::optional<array>& sinks) {
   encoder.set_input_array(q);
   encoder.set_input_array(k);
   encoder.set_input_array(v);
   if (sinks) {
     encoder.set_input_array(*sinks);
+  }
+  if (mask_arr) {
+    encoder.set_input_array(*mask_arr);
   }
   encoder.set_output_array(o);
 
@@ -490,12 +583,21 @@ void sdpa_vector_1pass_fallback(
       /* int kL = */ k.shape(2),
 
       /* int gqa_factor = */ q.shape(1) / k.shape(1),
+      /* int maskH = */ mask_arr ? mask_arr->shape(1) : 0,
       /* float scale = */ scale,
 
       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
-      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
+      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)},
+      /* int64_t M_strides[4] = */ {0, 0, 0, 0}};
+
+  if (mask_arr) {
+    params.M_strides[0] = mask_arr->strides(0);
+    params.M_strides[1] = mask_arr->strides(1);
+    params.M_strides[2] = mask_arr->strides(2);
+    params.M_strides[3] = mask_arr->strides(3);
+  }
 
   dim3 grid_dim(params.H, params.qL, params.B);
   dim3 block_dim(1024, 1, 1);
@@ -515,6 +617,7 @@ void sdpa_vector_1pass_fallback(
             gpu_ptr<DataType>(k),
             gpu_ptr<DataType>(v),
             gpu_ptr<DataType>(o),
+            mask_arr ? gpu_ptr<DataType>(*mask_arr) : nullptr,
             sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
             params);
       });
@@ -531,6 +634,7 @@ void sdpa_vector_2pass_fallback(
     const float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask_arr,
     const std::optional<array>& sinks) {
   cu::AttnParams params{
       /* int B = */ q.shape(0),
@@ -541,12 +645,21 @@ void sdpa_vector_2pass_fallback(
       /* int kL = */ k.shape(2),
 
       /* int gqa_factor = */ q.shape(1) / k.shape(1),
+      /* int maskH = */ mask_arr ? mask_arr->shape(1) : 0,
       /* float scale = */ scale,
 
       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
-      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
+      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)},
+      /* int64_t M_strides[4] = */ {0, 0, 0, 0}};
+
+  if (mask_arr) {
+    params.M_strides[0] = mask_arr->strides(0);
+    params.M_strides[1] = mask_arr->strides(1);
+    params.M_strides[2] = mask_arr->strides(2);
+    params.M_strides[3] = mask_arr->strides(3);
+  }
 
   // Allocate the intermediates
   int blocks = 32;
@@ -586,6 +699,9 @@ void sdpa_vector_2pass_fallback(
           if (sinks) {
             encoder.set_input_array(*sinks);
           }
+          if (mask_arr) {
+            encoder.set_input_array(*mask_arr);
+          }
 
           encoder.set_output_array(intermediate);
           encoder.set_output_array(sums);
@@ -601,6 +717,7 @@ void sdpa_vector_2pass_fallback(
               gpu_ptr<DataType>(q),
               gpu_ptr<DataType>(k),
               gpu_ptr<DataType>(v),
+              mask_arr ? gpu_ptr<DataType>(*mask_arr) : nullptr,
               sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
               gpu_ptr<float>(intermediate),
               gpu_ptr<float>(sums),
@@ -644,15 +761,20 @@ void sdpa_vector_fallback(
     const float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask_arr,
     const std::optional<array>& sinks) {
   int kL = k.shape(2);
 
-  if (kL > 1024) {
+  // The 2-pass kernel improves decode latency by parallelizing a single query
+  // across KV blocks, but it materializes partials proportional to qL. For
+  // prefill there is already enough parallelism across query positions, so use
+  // the one-pass kernel to avoid enormous temporary buffers.
+  if (kL >= 1024 && q.shape(2) < 4) {
     return sdpa_vector_2pass_fallback(
-        s, encoder, q, k, v, scale, o, do_causal, sinks);
+        s, encoder, q, k, v, scale, o, do_causal, mask_arr, sinks);
   } else {
     return sdpa_vector_1pass_fallback(
-        s, encoder, q, k, v, scale, o, do_causal, sinks);
+        s, encoder, q, k, v, scale, o, do_causal, mask_arr, sinks);
   }
 }
 
@@ -660,7 +782,6 @@ void sdpa_vector_fallback(
 
 bool supports_sdpa_vector(
     const array& q,
-    const array& k,
     const array& v,
     bool has_arr_mask,
     bool output_logsumexp) {
@@ -671,15 +792,14 @@ bool supports_sdpa_vector(
   const int value_head_dim = v.shape(-1);
   const int query_head_dim = q.shape(-1);
   const int query_sequence_length = q.shape(2);
-  const int key_sequence_length = k.shape(2);
-
   const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
-
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256 || query_head_dim == 512);
+  const bool wide_head_dim = query_head_dim == 256 || query_head_dim == 512;
   const bool supported_vector_config =
-      sdpa_supported_head_dim && query_sequence_length < 4;
+      wide_head_dim || (query_sequence_length < 4 && !has_arr_mask);
 
-  return supported_vector_config && !has_arr_mask;
+  return sdpa_supported_head_dim && supported_vector_config;
 }
 
 void sdpa_vector(
@@ -689,6 +809,7 @@ void sdpa_vector(
     float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask_arr_pre,
     const std::optional<array>& sinks_pre,
     Stream s) {
   auto& encoder = cu::get_command_encoder(s);
@@ -696,7 +817,7 @@ void sdpa_vector(
 
   // Define some copy functions to ensure the layout of the inputs is as
   // expected.
-  copies.reserve(4);
+  copies.reserve(5);
   auto copy_unless = [&copies, &s](
                          auto predicate, const array& arr) -> const array& {
     if (!predicate(arr)) {
@@ -716,6 +837,11 @@ void sdpa_vector(
   std::optional<array> sinks = std::nullopt;
   if (sinks_pre) {
     sinks = copy_unless(is_matrix_contiguous, sinks_pre.value());
+  }
+
+  std::optional<array> mask_arr = std::nullopt;
+  if (mask_arr_pre) {
+    mask_arr = copy_unless(is_matrix_contiguous, mask_arr_pre.value());
   }
 
   // We are in vector mode ie single query
@@ -781,12 +907,23 @@ void sdpa_vector(
       encoder.add_temporary(cp);
     }
 
-    sdpa_vector_fallback(s, encoder, q, k, v, scale, o, do_causal, sinks);
+    sdpa_vector_fallback(
+        s, encoder, q, k, v, scale, o, do_causal, mask_arr, sinks);
   }
 
-  // Full attention mode should never reach here
   else {
-    throw std::runtime_error("Doesn't support matrix yet.");
+    const auto& q = copy_unless(is_matrix_contiguous, q_pre);
+    const auto& k = copy_unless(is_matrix_contiguous, k_pre);
+    const auto& v = copy_unless(is_matrix_contiguous, v_pre);
+
+    o.set_data(cu::malloc_async(o.nbytes(), encoder));
+
+    for (const auto& cp : copies) {
+      encoder.add_temporary(cp);
+    }
+
+    sdpa_vector_fallback(
+        s, encoder, q, k, v, scale, o, do_causal, mask_arr, sinks);
   }
 }
 

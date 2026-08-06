@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/device/cast_op.cuh"
@@ -25,6 +25,43 @@ inline __device__ T softmax_exp(T x) {
   // Softmax doesn't need high precision exponential cause x is gonna be in
   // (-oo, 0] anyway and subsequently it will be divided by sum(exp(x_i)).
   return __expf(x);
+}
+
+template <typename T, typename AccT, int N_READS>
+__global__ void softmax_warp(const T* in, T* out, int axis_size) {
+  auto grid = cg::this_grid();
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<WARP_SIZE>(block);
+
+  in += grid.block_rank() * axis_size;
+  out += grid.block_rank() * axis_size;
+
+  auto index = block.thread_rank();
+  auto vals = load_vector<N_READS>(in, index, axis_size, Limits<T>::min());
+
+  cg::greater<AccT> max_op;
+  AccT maxval = Limits<AccT>::finite_min();
+#pragma unroll
+  for (int i = 0; i < N_READS; ++i) {
+    maxval = max_op(maxval, static_cast<AccT>(vals[i]));
+  }
+  maxval = cg::reduce(warp, maxval, max_op);
+
+  AccT exp_vals[N_READS];
+  AccT normalizer = cast_to<AccT>(0);
+#pragma unroll
+  for (int i = 0; i < N_READS; ++i) {
+    exp_vals[i] = softmax_exp(static_cast<AccT>(vals[i]) - maxval);
+    normalizer += exp_vals[i];
+  }
+  normalizer = cg::reduce(warp, normalizer, cg::plus<AccT>{});
+  normalizer = 1 / normalizer;
+
+#pragma unroll
+  for (int i = 0; i < N_READS; ++i) {
+    vals[i] = static_cast<T>(exp_vals[i] * normalizer);
+  }
+  store_vector<N_READS>(out, index, vals, axis_size);
 }
 
 template <typename T, typename AccT, int BLOCK_DIM, int N_READS = 4>
@@ -141,20 +178,43 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "softmax", [&](auto type_tag) {
     using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
-    constexpr int N_READS = 16 / sizeof(DataType);
-    dispatch_block_dim(cuda::ceil_div(axis_size, N_READS), [&](auto block_dim) {
-      auto kernel = cu::softmax<DataType, DataType, block_dim(), N_READS>;
-      if (precise) {
-        kernel = cu::softmax<DataType, float, block_dim(), N_READS>;
+    constexpr int default_n_reads = 16 / sizeof(DataType);
+    auto dispatch_n_reads = [&](auto n_reads) {
+      constexpr int N_READS = decltype(n_reads)::value;
+      dispatch_block_dim(
+          cuda::ceil_div(axis_size, N_READS), [&](auto block_dim) {
+            constexpr int BLOCK_DIM = decltype(block_dim)::value;
+            auto launch = [&](auto kernel) {
+              encoder.add_kernel_node(
+                  kernel,
+                  n_rows,
+                  BLOCK_DIM,
+                  gpu_ptr<DataType>(in),
+                  gpu_ptr<DataType>(out),
+                  axis_size);
+            };
+            if constexpr (BLOCK_DIM == WARP_SIZE) {
+              if (precise) {
+                launch(cu::softmax_warp<DataType, float, N_READS>);
+              } else {
+                launch(cu::softmax_warp<DataType, DataType, N_READS>);
+              }
+            } else {
+              if (precise) {
+                launch(cu::softmax<DataType, float, BLOCK_DIM, N_READS>);
+              } else {
+                launch(cu::softmax<DataType, DataType, BLOCK_DIM, N_READS>);
+              }
+            }
+          });
+    };
+    if constexpr (sizeof(DataType) == 2) {
+      if (axis_size <= 128) {
+        dispatch_n_reads(std::integral_constant<int, 4>{});
+        return;
       }
-      encoder.add_kernel_node(
-          kernel,
-          n_rows,
-          block_dim(),
-          gpu_ptr<DataType>(in),
-          gpu_ptr<DataType>(out),
-          axis_size);
-    });
+    }
+    dispatch_n_reads(std::integral_constant<int, default_n_reads>{});
   });
 }
 

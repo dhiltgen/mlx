@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/cudnn_utils.h"
 #include "mlx/backend/cuda/device.h"
@@ -329,6 +329,9 @@ bool supports_sdpa_cudnn(
     return false;
   }
 
+  int query_head_dim = q.shape(-1);
+  int value_head_dim = v.shape(-1);
+
   // Only use cuDNN for decoding when k/v are slices from fixed-size kv cache.
   if ((q.shape(2) == 1) && !use_cudnn_for_decoding(q, k, v, has_arr_mask)) {
     return false;
@@ -339,9 +342,11 @@ bool supports_sdpa_cudnn(
     return false;
   }
 
-  // D_qk and D_v must be a multiple of 8 with maximum value 128.
-  if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > 128) || (v.shape(-1) % 8 != 0) ||
-      (v.shape(-1) > 128)) {
+  // cuDNN SDPA supports head dimensions up to 128. Wider shapes use MLX's
+  // CUDA SDPA kernel.
+  constexpr int max_head_dim = 128;
+  if ((query_head_dim % 8 != 0) || (query_head_dim > max_head_dim) ||
+      (value_head_dim % 8 != 0) || (value_head_dim > max_head_dim)) {
     return false;
   }
 
@@ -533,7 +538,6 @@ void sdpa_backward_cudnn(
 // Defined in scaled_dot_product_attention.cu file.
 bool supports_sdpa_vector(
     const array& q,
-    const array& k,
     const array& v,
     bool has_arr_mask,
     bool output_logsumexp);
@@ -544,6 +548,7 @@ void sdpa_vector(
     float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask_arr,
     const std::optional<array>& sinks,
     Stream s);
 
@@ -564,7 +569,7 @@ bool ScaledDotProductAttention::use_fallback(
   }
 
   return !supports_sdpa_cudnn(q, k, v, has_arr_mask, do_causal, s) &&
-      !supports_sdpa_vector(q, k, v, has_arr_mask, output_logsumexp);
+      !supports_sdpa_vector(q, v, has_arr_mask, output_logsumexp);
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -615,7 +620,7 @@ void ScaledDotProductAttention::eval_gpu(
         output_logsumexp_,
         s);
   } else {
-    sdpa_vector(q, k, v, scale_, out, do_causal_, sinks, s);
+    sdpa_vector(q, k, v, scale_, out, do_causal_, mask_arr, sinks, s);
   }
 }
 

@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #pragma once
 
@@ -159,8 +159,13 @@ class CommandEncoder {
   std::unordered_map<std::uintptr_t, GraphNode> node_map_;
   size_t bytes_in_graph_{0};
   bool is_graph_updatable_{true};
+  bool adaptive_graph_limits_{false};
+  bool has_large_batch_output_{false};
+  bool has_small_batch_activation_{false};
   int max_ops_per_graph_;
   int max_mb_per_graph_;
+  int max_small_batch_ops_per_graph_;
+  int max_small_batch_mb_per_graph_;
 };
 
 class Device {
@@ -196,6 +201,9 @@ class Device {
   bool memory_pools() const {
     return memory_pools_ == 1;
   }
+  bool integrated() const {
+    return integrated_ == 1;
+  }
 
  private:
   int device_;
@@ -205,6 +213,7 @@ class Device {
   int host_native_atomic_;
   int managed_memory_;
   int memory_pools_;
+  int integrated_;
   std::string device_name_;
 };
 

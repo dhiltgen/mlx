@@ -482,6 +482,15 @@ class TestFast(mlx_tests.MLXTestCase):
             x = mx.random.uniform(shape=(1, 5))
             mx.fast.rms_norm(x, mx.ones((4,)), 1e-5)
 
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
+    def test_rms_norm_2816(self):
+        for dtype, atol in [(mx.float16, 1e-3), (mx.bfloat16, 1e-2)]:
+            x = mx.random.uniform(shape=(2, 2816)).astype(dtype)
+            weight = mx.random.uniform(shape=(2816,)).astype(dtype)
+            expected = rms_norm(x, weight, 1e-5)
+            actual = mx.fast.rms_norm(x, weight, 1e-5)
+            self.assertLess(mx.abs(expected - actual).max(), atol)
+
     def test_rms_norm_grad(self):
         eps = 1e-5
         f1 = lambda x, w, y: (rms_norm(x, w, eps) * y).sum()

@@ -12,6 +12,8 @@ using namespace cute;
 
 template <typename Element,
           typename Quant,
+          typename Scale,
+          int ScaleCount,
           typename SmemLayoutA,
           typename SmemLayoutB,
           typename SmemLayoutC>
@@ -19,6 +21,8 @@ union SharedStorage {
   struct {
     ArrayEngine<Element, cosize_v<SmemLayoutA>> A;
     ArrayEngine<Quant,   cosize_v<SmemLayoutB>> B;
+    ArrayEngine<Scale, ScaleCount> S;
+    ArrayEngine<Element, ScaleCount> Z;
   } mainloop;
   struct {
     ArrayEngine<Element, cosize_v<SmemLayoutC>> C;
@@ -67,7 +71,8 @@ inline constexpr auto make_tiled_copy(NumThreads num_threads) {
       make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
-template <typename CtaTiler,
+template <int GroupSize,
+          typename CtaTiler,
           typename TensorA,
           typename TensorB,
           typename TensorS,
@@ -81,6 +86,9 @@ CUTE_DEVICE void qmm_sm80_mainloop(
     TensorZ gZ,
     TensorC gC,
     int m_max_coord,
+    int n_max_coord,
+    int m_store_begin,
+    int m_store_end,
     int thread_idx) {
   // Get the types of operands.
   using Element = typename decltype(gA)::value_type;
@@ -91,14 +99,30 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   auto [sA_layout, sB_layout, sC_layout] = make_smem_layouts(cta_tiler);
 
   // Shared memory buffer.
+  constexpr int tile_n = decltype(size<1>(cta_tiler))::value;
+  constexpr int tile_k = decltype(size<2>(cta_tiler))::value;
+  constexpr int scale_groups = tile_k / GroupSize;
+  constexpr int scale_pipe = decltype(size<2>(sA_layout))::value;
+  constexpr int scale_count = tile_n * scale_groups * scale_pipe;
+  auto sS_layout = make_layout(
+      make_shape(
+          size<1>(cta_tiler),
+          make_shape(Int<GroupSize>{}, Int<scale_groups>{}),
+          size<2>(sA_layout)),
+      make_stride(
+          Int<scale_groups>{},
+          Stride<_0,_1>{},
+          Int<tile_n * scale_groups>{}));
   extern __shared__ char smem_buf[];
-  using SharedStorage = SharedStorage<Element, Quant,
+  using SharedStorage = SharedStorage<Element, Quant, Scale, scale_count,
                                       decltype(sA_layout),
                                       decltype(sB_layout),
                                       decltype(sC_layout)>;
   SharedStorage& smem = *reinterpret_cast<SharedStorage*>(smem_buf);
   Tensor sA = make_tensor(make_smem_ptr(smem.mainloop.A.begin()), sA_layout); // (BLK_M,BLK_K)
   Tensor sB = make_tensor(make_smem_ptr(smem.mainloop.B.begin()), sB_layout); // (BLK_N,BLK_K)
+  Tensor sS = make_tensor(make_smem_ptr(smem.mainloop.S.begin()), sS_layout); // (BLK_N,BLK_K,PIPE)
+  Tensor sZ = make_tensor(make_smem_ptr(smem.mainloop.Z.begin()), sS_layout); // (BLK_N,BLK_K,PIPE)
   Tensor sC = make_tensor(make_smem_ptr(smem.epilogue.C.begin()), sC_layout); // (BLK_M,BLK_N)
 
   // Define MMA.
@@ -116,7 +140,8 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
   Copy_Atom<UniversalCopy<uint_bit_t<2 * quant_bits>>, Quant> s2r_atom_b;
   Copy_Atom<UniversalCopy<uint_bit_t<2 * element_bits>>, Element> r2s_atom_c;
-  Copy_Atom<UniversalCopy<Scale>, Scale> g2r_atom_s;
+  Copy_Atom<UniversalCopy<Scale>, Scale> s2r_atom_s;
+  Copy_Atom<UniversalCopy<Element>, Element> s2r_atom_z;
 
   // Partition the copying of A/B/C tiles across the threads.
   ThrCopy g2s_thr_copy_a = g2s_copy_a.get_slice(thread_idx);
@@ -141,10 +166,10 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   Tensor tCrC_accu = make_fragment_like<float>(tCgC);    // (MMA,MMA_M,MMA_N)
   Tensor tCrC = make_fragment_like<Element>(tCgC);       // (MMA,MMA_M,MMA_N)
 
-  Tensor tCgS = thr_mma.partition_B(gS);         // (MMA,MMA_N,MMA_K,k)
-  Tensor tCrS = make_tensor_like(tCgS(_,_,_,0)); // (MMA,MMA_N,MMA_K)
-  Tensor tCgZ = thr_mma.partition_B(gZ);         // (MMA,MMA_N,MMA_K,k)
-  Tensor tCrZ = make_tensor_like(tCgZ(_,_,_,0)); // (MMA,MMA_N,MMA_K)
+  Tensor tCsS = thr_mma.partition_B(sS(_,_,0)); // (MMA,MMA_N,MMA_K)
+  Tensor tCrS = make_tensor_like(tCsS);         // (MMA,MMA_N,MMA_K)
+  Tensor tCsZ = thr_mma.partition_B(sZ(_,_,0)); // (MMA,MMA_N,MMA_K)
+  Tensor tCrZ = make_tensor_like(tCsZ);         // (MMA,MMA_N,MMA_K)
 
   // Copy Atom retiling.
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
@@ -162,27 +187,45 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   Tensor r2s_tCrC = r2s_thr_copy_c.retile_S(tCrC);  // (CCPY,MMA_M,MMA_N)
   Tensor r2s_tCsC = r2s_thr_copy_c.partition_D(sC); // (CCPY,MMA_M,MMA_N)
 
-  TiledCopy g2r_copy_s = make_tiled_copy_B(g2r_atom_s, mma);
-  ThrCopy g2r_thr_copy_s = g2r_copy_s.get_slice(thread_idx);
-  Tensor g2r_tCgS = g2r_thr_copy_s.partition_S(gS); // (BCPY,MMA_N,MMA_K,k)
-  Tensor g2r_tCrS = g2r_thr_copy_s.retile_D(tCrS);  // (BCPY,MMA_N,MMA_K)
-  Tensor g2r_tCgZ = g2r_thr_copy_s.partition_S(gZ); // (BCPY,MMA_N,MMA_K,k)
-  Tensor g2r_tCrZ = g2r_thr_copy_s.retile_D(tCrZ);  // (BCPY,MMA_N,MMA_K)
+  TiledCopy s2r_copy_s = make_tiled_copy_B(s2r_atom_s, mma);
+  ThrCopy s2r_thr_copy_s = s2r_copy_s.get_slice(thread_idx);
+  Tensor s2r_tCsS = s2r_thr_copy_s.partition_S(sS); // (BCPY,MMA_N,MMA_K,PIPE)
+  Tensor s2r_tCrS = s2r_thr_copy_s.retile_D(tCrS);  // (BCPY,MMA_N,MMA_K)
 
-  // Predicates for m bound.
+  TiledCopy s2r_copy_z = make_tiled_copy_B(s2r_atom_z, mma);
+  ThrCopy s2r_thr_copy_z = s2r_copy_z.get_slice(thread_idx);
+  Tensor s2r_tCsZ = s2r_thr_copy_z.partition_S(sZ); // (BCPY,MMA_N,MMA_K,PIPE)
+  Tensor s2r_tCrZ = s2r_thr_copy_z.retile_D(tCrZ);  // (BCPY,MMA_N,MMA_K)
+
+  // Predicates for m/n bounds.
   Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA), size<2>(tAsA)), Stride<_1,_0>{});         // (CPY_M,CPY_K)
-  Tensor tCpC = make_tensor<bool>(make_shape(size<1>(s2g_tCsC), size<2>(s2g_tCsC)), Stride<_1,_0>{}); // (CPY_M,CPY_N)
+  Tensor tBpB = make_tensor<bool>(make_shape(size<1>(tBsB), size<2>(tBsB)), Stride<_1,_0>{});         // (CPY_N,CPY_K)
+  Tensor tCpC = make_tensor<bool>(
+      make_shape(size<1>(s2g_tCsC), size<2>(s2g_tCsC)),
+      make_stride(Int<1>{}, size<1>(s2g_tCsC))); // (CPY_M,CPY_N)
   Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA))); // (BLK_M,BLK_K)
+  Tensor cB = make_identity_tensor(make_shape(size<0>(sB), size<1>(sB))); // (BLK_N,BLK_K)
   Tensor cC = make_identity_tensor(make_shape(size<0>(sC), size<1>(sC))); // (BLK_M,BLK_N)
   Tensor tAcA = g2s_thr_copy_a.partition_D(cA); // (CPY,CPY_M,CPY_K)
+  Tensor tBcB = g2s_thr_copy_b.partition_S(cB); // (CPY,CPY_N,CPY_K)
   Tensor tCcC = s2g_thr_copy_c.partition_D(cC); // (CPY,CPY_M,CPY_N)
   CUTE_UNROLL
   for (int m = 0; m < size<0>(tApA); ++m) {
     tApA(m,0) = get<0>(tAcA(0,m,0)) < m_max_coord;
   }
   CUTE_UNROLL
+  for (int n = 0; n < size<0>(tBpB); ++n) {
+    tBpB(n,0) = get<0>(tBcB(0,n,0)) < n_max_coord;
+  }
+  CUTE_UNROLL
   for (int m = 0; m < size<0>(tCpC); ++m) {
-    tCpC(m,0) = get<0>(tCcC(0,m,0)) < m_max_coord;
+    CUTE_UNROLL
+    for (int n = 0; n < size<1>(tCpC); ++n) {
+      int row = get<0>(tCcC(0,m,n));
+      int col = get<1>(tCcC(0,m,n));
+      tCpC(m,n) = row < m_max_coord && col < n_max_coord &&
+          row >= m_store_begin && row < m_store_end;
+    }
   }
 
   auto K_PIPE_MAX = size<3>(tAsA);
@@ -191,16 +234,38 @@ CUTE_DEVICE void qmm_sm80_mainloop(
 
   // Copy A/B: GMEM => SMEM.
   auto fetch_gmem = [&](int tile) {
+    int pipe = smem_pipe_write;
     copy_if(g2s_copy_a, tApA, tAgA(_,_,_,tile), tAsA(_,_,_,smem_pipe_write));
-    copy(g2s_copy_b, tBgB(_,_,_,tile), tBsB(_,_,_,smem_pipe_write));
+    copy_if(g2s_copy_b, tBpB, tBgB(_,_,_,tile), tBsB(_,_,_,smem_pipe_write));
+    if (thread_idx < tile_n) {
+      CUTE_UNROLL
+      for (int group = 0; group < scale_groups; ++group) {
+        Scale scale{};
+        Element bias{};
+        if (thread_idx < n_max_coord) {
+          scale = gS(thread_idx, group * GroupSize, tile);
+          if constexpr (mlx::core::cu::quant_has_bias_v<Quant>) {
+            bias = gZ(thread_idx, group * GroupSize, tile);
+          }
+        }
+        sS(thread_idx, group * GroupSize, pipe) = scale;
+        sZ(thread_idx, group * GroupSize, pipe) = bias;
+      }
+    }
     cp_async_fence();
     smem_pipe_write = (smem_pipe_write + 1) % K_PIPE_MAX;
   };
-  // Copy S/Z: GMEM => RMEM.
-  auto fetch_scales = [&](int tile) {
-    copy(g2r_copy_s, g2r_tCgS(_,_,_,tile), g2r_tCrS);
-    if constexpr (mlx::core::cu::quant_has_bias_v<Quant>) {
-      copy(g2r_copy_s, g2r_tCgZ(_,_,_,tile), g2r_tCrZ);
+  // Copy S/Z: SMEM => RMEM.
+  auto fetch_scales = [&]() {
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(s2r_tCrS); ++k) {
+      CUTE_UNROLL
+      for (int n = 0; n < size<1>(s2r_tCrS); ++n) {
+        copy(s2r_tCsS(_,n,k,smem_pipe_read), s2r_tCrS(_,n,k));
+        if constexpr (mlx::core::cu::quant_has_bias_v<Quant>) {
+          copy(s2r_tCsZ(_,n,k,smem_pipe_read), s2r_tCrZ(_,n,k));
+        }
+      }
     }
   };
   // Copy A/B: SMEM => RMEM.
@@ -224,7 +289,13 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   int tile_pipe = 0;
   CUTE_UNROLL
   for (; tile_pipe < K_PIPE_MAX - 1; ++tile_pipe) {
-    fetch_gmem(tile_pipe);
+    if (tile_pipe < K_TILE_MAX) {
+      fetch_gmem(tile_pipe);
+    } else {
+      // Keep the three-stage wait cadence without issuing speculative writes
+      // that can race with the shared-memory epilogue.
+      cp_async_fence();
+    }
   }
 
   // Clear accumulators.
@@ -234,7 +305,7 @@ CUTE_DEVICE void qmm_sm80_mainloop(
   if constexpr (K_BLOCK_MAX > 1) {
     cp_async_wait<K_PIPE_MAX - 2>();
     __syncthreads();
-    fetch_scales(0);
+    fetch_scales();
     fetch_smem(Int<0>{});
   }
 
@@ -248,14 +319,20 @@ CUTE_DEVICE void qmm_sm80_mainloop(
         smem_pipe_read = (smem_pipe_read + 1) % K_PIPE_MAX;
         cp_async_wait<K_PIPE_MAX - 2>();
         __syncthreads();
-        fetch_scales((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+        fetch_scales();
       }
       // Prefetch next block.
       fetch_smem((block + 1) % K_BLOCK_MAX);
       // Prefetch next tile.
       if (block == 0) {
-        fetch_gmem(tile_pipe);
-        tile_pipe = (tile_pipe + 1 < K_TILE_MAX) ? tile_pipe + 1 : tile_pipe;
+        if (tile_pipe < K_TILE_MAX) {
+          fetch_gmem(tile_pipe);
+        } else {
+          // Keep the three-stage wait cadence without issuing speculative
+          // writes that can race with the shared-memory epilogue.
+          cp_async_fence();
+        }
+        ++tile_pipe;
       }
       // MMA.
       gemm(mma, tCrA(_,_,block), tCrB_dq(_,_,block), tCrC_accu);
@@ -343,8 +420,9 @@ void qmm_sm80_kernel(
 
   // Compute tile residues for predication.
   auto m_max_coord = m - size<0>(gA) * m_coord; // M - BLK_M * m_coord
+  auto n_max_coord = n - size<1>(cta_tiler) * n_coord; // N - BLK_N * n_coord
 
-  qmm_sm80_mainloop(
+  qmm_sm80_mainloop<GroupSize>(
       cta_tiler,
       gA,
       gB,
@@ -352,7 +430,115 @@ void qmm_sm80_kernel(
       gZ,
       gC,
       m_max_coord,
+      n_max_coord,
+      0,
+      int(size<0>(cta_tiler)),
       thread_idx);
+}
+
+template <int GroupSize,
+          typename Element, typename Quant, typename Scale, typename CtaTiler>
+__global__
+__launch_bounds__(decltype(size(make_tiled_mma()))::value)
+void qmm_sm80_rhs_kernel(
+    const Element* A,
+    const Quant* B,
+    const Scale* S,
+    const Element* Z,
+    const uint32_t* rhs_indices,
+    Element* C,
+    int m,
+    int n,
+    int k,
+    int group_count) {
+  int thread_idx = int(threadIdx.x);
+  int m_coord = int(blockIdx.x);
+  int n_coord = int(blockIdx.y);
+
+  auto cta_tiler = CtaTiler{};
+  int tile_m = int(size<0>(cta_tiler));
+  int y_row = m_coord * tile_m;
+  int m_max_coord = m - y_row;
+  int tgp_m = m_max_coord < tile_m ? m_max_coord : tile_m;
+  int n_max_coord = n - int(size<1>(cta_tiler)) * n_coord;
+  if (tgp_m <= 0) {
+    return;
+  }
+
+  // Define layouts (mixed). cuBLASLt's block-scaled GEMM cannot combine the
+  // per-row expert gather with this scale layout, so the sorted RHS path
+  // treats all selected rows as one matrix and reuses each expert tile across
+  // contiguous same-expert runs inside the row tile.
+  auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
+  auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
+  auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
+  auto S_layout = make_scales_layout<GroupSize>(n, k, group_count);
+
+  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        make_shape(m, k, 1), dA); // (M,K,L)
+  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), make_shape(n, k, group_count), dB); // (N,K,L)
+  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        make_shape(m, n, 1), dC); // (M,N,L)
+
+  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
+  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
+
+  Tensor mA = mA_mkl(_,_,0); // (M,K)
+  Tensor mC = mC_mnl(_,_,0); // (M,N)
+  uint32_t index_next = rhs_indices[y_row];
+  int offset_next = 0;
+  while (offset_next < tgp_m) {
+    int offset = offset_next;
+    uint32_t b_batch = index_next;
+    offset_next = tgp_m;
+    for (int row = offset + 1; row < tgp_m; ++row) {
+      uint32_t index = rhs_indices[y_row + row];
+      if (index != b_batch) {
+        offset_next = row;
+        index_next = index;
+        break;
+      }
+    }
+    __syncthreads();
+
+    int run_rows = offset_next - offset;
+    Tensor mA_offset =
+        domain_offset(make_coord(y_row + offset, 0), mA);
+    Tensor mC_offset =
+        domain_offset(make_coord(y_row + offset, 0), mC);
+    Tensor mB = mB_nkl(_,_,b_batch); // (N,K)
+    Tensor mS = mS_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+    Tensor mZ = mZ_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+
+    auto run_qmm = [&](auto run_tiler) {
+      Tensor gA = local_tile(mA_offset, run_tiler, make_coord(0, n_coord, _), Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+      Tensor gB = local_tile(mB, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+      Tensor gC = local_tile(mC_offset, run_tiler, make_coord(0, n_coord, _), Step<_1,_1, X>{}); // (BLK_M,BLK_N)
+      Tensor gS = local_tile(mS, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+      Tensor gZ = local_tile(mZ, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+
+      qmm_sm80_mainloop<GroupSize>(
+          run_tiler,
+          gA,
+          gB,
+          gS,
+          gZ,
+          gC,
+          run_rows,
+          n_max_coord,
+          0,
+          run_rows,
+          thread_idx);
+    };
+
+    if (run_rows <= 16) {
+      run_qmm(make_shape(
+          Int<16>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
+    } else if (run_rows <= 32) {
+      run_qmm(make_shape(
+          Int<32>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
+    } else {
+      run_qmm(cta_tiler);
+    }
+  }
 }
 
 } // namespace mlx::core::cu
