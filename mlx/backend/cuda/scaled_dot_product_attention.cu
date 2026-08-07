@@ -829,9 +829,15 @@ __global__ void kernel_sdpav_fmma(
         for (int i = 0; i < NFRAG; ++i) {
           FragB vb;
           load_V_trans(vb, sV, k0, dslice0 + i * 8, KRP);
-          // Forensics hook (always null in production): the d512
-          // instantiation mis-compiles without this store's scheduling
-          // effect; root cause open (see experiment journal 2026-08-06).
+          // Forensics hook WORKAROUND (always null in production): the
+          // d512 instantiation mis-compiles without this store's
+          // scheduling effect; root cause open. Related driver-branch
+          // failure: on Windows-N1x 615.x this whole kernel produces
+          // corrupted output (ldmatrix/mma+smem path), so the kernel
+          // must stay env-gated on those stacks. Any bench number
+          // recorded with fmma+d512 or fmma-on-N1x engaged should be
+          // treated as compromised until the CuTe-rewrite lands (see
+          // experiment journal 2026-08-06, "fmma anomaly" sections).
           if (dbg_out != nullptr && blockIdx.x == 0 && blockIdx.z == 0 &&
               tid < 8 && i == 0 && k0 == 0 && kv0 == 0) {
             for (int t = 0; t < 4; ++t) {
@@ -1617,6 +1623,13 @@ bool sdpa_vector_fvec_route(
   cu::AttnParams params = sdpa_tiled_params(q, k, v, scale, o, mask_arr);
 
   // Tensor-core variant (bf16/f16 only) takes precedence when enabled.
+  // DRIVER-BUG WORKAROUND: kernel_sdpav_fmma produces corrupted output
+  // (garbage/NaN; ldmatrix reads of staged smem return zeros) on the
+  // Windows-N1x driver line (tested 615.83, GB10-class silicon), while
+  // identical SASS is correct on the Linux DGX driver (580.82) — see
+  // ollama notes/MLX-CUDA-UM-QMM-EXPERIMENTS.md "fmma anomaly" sections.
+  // Keep this gate OFF on N1x/615.x stacks; fvec and 1pass are safe
+  // there, and the gate defaults OFF everywhere for now.
   static bool fmma_enabled = env::get_var("MLX_CUDA_SDPA_FMMA_PREFILL", 0);
   if (fmma_enabled && (o.dtype() == bfloat16 || o.dtype() == float16)) {
     dispatch_bool(do_causal, [&](auto causal_tag) {
