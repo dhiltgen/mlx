@@ -89,6 +89,13 @@ const std::vector<std::string>& include_path_args() {
       }
     }
     args.push_back(fmt::format("--include-path={}", path.string()));
+    // Toolkit bundles may carry CCCL under <toolkit>/include/cccl (e.g.
+    // ollama's cuda_v13 layout). NVRTC resolves cuda/std/* only through an
+    // explicit include path, so it must be listed separately.
+    auto cccl_path = path / "cccl";
+    if (std::filesystem::exists(cccl_path)) {
+      args.push_back(fmt::format("--include-path={}", cccl_path.string()));
+    }
     return args;
   }();
   return cached_args;
