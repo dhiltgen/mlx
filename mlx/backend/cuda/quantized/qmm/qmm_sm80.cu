@@ -9,6 +9,7 @@
 #include "mlx/backend/cuda/quantized/qmm/qmm_utils.h"
 
 #include "cuda_jit_sources.h"
+#include "mlx/utils.h"
 
 namespace mlx::core {
 
@@ -16,7 +17,13 @@ namespace {
 
 inline auto make_cta_tiler(int m, int group_size) {
   int tile_m = std::max(16, std::min(64, next_power_of_2(m)));
-  int tile_n = 128;
+  // Opt-out knob: MLX_CUDA_QMM_SM80_TILE_N overrides tile_n (e.g. 64).
+  // A/B for the N1x (615.x) m64 prefill regression — checks whether the
+  // 128-wide smem/tile pattern is what the post-crash WDDM driver
+  // mishandles, before committing to a full retune.
+  static const int tile_n_override =
+      env::get_var("MLX_CUDA_QMM_SM80_TILE_N", 128);
+  int tile_n = tile_n_override > 0 ? tile_n_override : 128;
   int tile_k = std::max(64, group_size);
   return cute::make_shape(tile_m, tile_n, tile_k);
 }
