@@ -3,6 +3,7 @@
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/backend/cuda/quantized/qmm/qmm_utils.h"
+#include "mlx/utils.h"
 
 #include <cute/tensor.hpp>
 
@@ -72,6 +73,16 @@ bool supports_qmm_sm80(
     int group_size,
     QuantizationMode mode,
     cu::Device& device) {
+  // Opt-out probe: MLX_CUDA_QMM_DISABLE_SM80=1 forces the naive qmm path.
+  // A/B knob for the N1x (615.x) dense-qqmm prefill regression — the sm80_ss
+  // CuTe kernels run at ~40-55% of their pre-crash rate on the WDDM driver
+  // while gathers/nvjet stay healthy (ollama notes/MLX-CUDA-UM-QMM-
+  // EXPERIMENTS.md, 2026-08-07). Lets us compare naive vs sm80 vs dequant
+  // on identical box state.
+  static const bool disable_sm80 = env::get_var("MLX_CUDA_QMM_DISABLE_SM80", 0);
+  if (disable_sm80) {
+    return false;
+  }
   if (device.compute_capability_major() < 8) {
     return false;
   }
