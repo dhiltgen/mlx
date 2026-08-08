@@ -343,8 +343,12 @@ bool supports_sdpa_cudnn(
   }
 
   // cuDNN SDPA supports head dimensions up to 128. Wider shapes use MLX's
-  // CUDA SDPA kernel.
-  constexpr int max_head_dim = 128;
+  // CUDA SDPA kernel. A/B probe: MLX_CUDA_CUDNN_SDPA_MAX_HD lifts the cap
+  // (e.g. 256) to test whether this cudnn build handles dh256 sdpa graphs
+  // (N1x dense-gemma4 prefill investigation, 2026-08-07). On failure the
+  // caller's graph construction throws — use only for diagnostic runs.
+  static const int max_head_dim =
+      env::get_var("MLX_CUDA_CUDNN_SDPA_MAX_HD", 128);
   if ((query_head_dim % 8 != 0) || (query_head_dim > max_head_dim) ||
       (value_head_dim % 8 != 0) || (value_head_dim > max_head_dim)) {
     return false;
