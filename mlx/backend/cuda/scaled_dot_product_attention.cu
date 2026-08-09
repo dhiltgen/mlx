@@ -1996,7 +1996,7 @@ bool sdpa_vector_fvec_route(
     const std::optional<array>& mask_arr,
     const std::optional<array>& sinks) {
   static bool enabled = env::get_var("MLX_CUDA_SDPA_FVEC_PREFILL", 0);
-  static bool tmma_enabled = env::get_var("MLX_CUDA_SDPA_TMMA_PREFILL", 0);
+  static bool tmma_enabled = env::get_var("MLX_CUDA_SDPA_TMMA_PREFILL", 1);
   if (!enabled && !tmma_enabled) {
     return false;
   }
