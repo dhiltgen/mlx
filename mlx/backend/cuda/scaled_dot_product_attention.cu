@@ -885,6 +885,8 @@ __global__ void kernel_sdpav_fmma(
 
 namespace tmma_detail {
 
+using fmma_detail::FragB;
+
 // Scores-side B fragment (16k x 8n of K) via one ldmatrix x2 instead of
 // per-lane 2-byte gathers. Lane address mapping pinned by bit-exact probe
 // (.tmp/tmma_ldsm_unit.cu): matrix 0 covers kv rows 0-7 at the d0 column
