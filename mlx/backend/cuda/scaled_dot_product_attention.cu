@@ -883,6 +883,343 @@ __global__ void kernel_sdpav_fmma(
   }
 }
 
+namespace tmma_detail {
+
+// Scores-side B fragment (16k x 8n of K) via one ldmatrix x2 instead of
+// per-lane 2-byte gathers. Lane address mapping pinned by bit-exact probe
+// (.tmp/tmma_ldsm_unit.cu): matrix 0 covers kv rows 0-7 at the d0 column
+// block, matrix 1 covers kv rows 0-7 at d0+8. Each lane receives
+// (K[n][k], K[n][k+1]) with n = kv0 + lane/4, k = d0 + (lane%4)*2(, +8),
+// which is exactly the row.col B layout mma.sync.m16n8k16 expects.
+template <typename T>
+__device__ __forceinline__ void
+ldsm_scores_B(FragB& b, const T* base, int row_stride) {
+  const int lane = threadIdx.x % 32;
+  const char* p = reinterpret_cast<const char*>(
+      base + (lane % 8) * row_stride + (lane / 8) * 8);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+               : "=r"(b.r[0]), "=r"(b.r[1])
+               : "l"(p)
+               : "memory");
+}
+
+// PV-side B fragment (16k x 8n of V^T) via one ldmatrix x2 .trans. Lane
+// address mapping pinned by probe: lanes 0-15 supply kv rows 0-15 at the
+// d0 column; the transpose distribution gives each lane
+// (V[k][n], V[k+1][n]) with n = d0 + lane/4, k = kv0 + (lane%4)*2(, +8).
+// Replaces the 2-byte memcpy gathers, whose upper halves picked up
+// undefined register residue (the N1x fmma corruption root cause).
+template <typename T>
+__device__ __forceinline__ void
+ldsm_pv_B(FragB& b, const T* base, int row_stride) {
+  const int lane = threadIdx.x % 32;
+  const char* p =
+      reinterpret_cast<const char*>(base + (lane % 16) * row_stride);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+               : "=r"(b.r[0]), "=r"(b.r[1])
+               : "l"(p)
+               : "memory");
+}
+
+} // namespace tmma_detail
+
+// Tensor-core query-tiled prefill attention for wide head dims: fmma's tile
+// architecture with both mma B-operand paths loaded via ldmatrix (scores K
+// non-trans, PV V trans) instead of per-lane 2-byte gathers. The gathers
+// read 2 bytes into uninitialized 32-bit registers, leaving the upper
+// halves undefined — deterministic corruption whenever the compiler does
+// not merge the pairs into 32-bit loads (Windows-N1x nvcc lowering), and
+// ~8x the load instructions in the hot loops even on stacks where the
+// merge luckily happens. Tile layout, online softmax, PV accumulation,
+// and the store epilogue are unchanged from kernel_sdpav_fmma.
+template <typename T, bool do_causal, int D>
+__global__ void kernel_sdpav_tmma(
+    const T* __restrict__ Q,
+    const T* __restrict__ K,
+    const T* __restrict__ V,
+    T* __restrict__ O,
+    const T* __restrict__ M,
+    const T* __restrict__ sinks,
+    __grid_constant__ const AttnParams params) {
+  using namespace fmma_detail;
+  using tmma_detail::ldsm_pv_B;
+  using tmma_detail::ldsm_scores_B;
+  constexpr int QT = 16;
+  constexpr int KB = D == 256 ? 32 : 16;
+  constexpr int KRP = D + 8;
+  constexpr int PRP = KB + 8;
+  constexpr int SRP = KB + 1;
+  constexpr int VEC = 16 / sizeof(T);
+  constexpr int THREADS = 256;
+  constexpr int NB = KB / 8;
+  constexpr int DSLICE = D / 8;
+  constexpr int NFRAG = DSLICE / 8;
+
+  typedef float U;
+
+  extern __shared__ char smem_raw[];
+  T* sQ = reinterpret_cast<T*>(smem_raw);
+  T* sK = sQ + QT * KRP;
+  T* sV = sK + KB * KRP;
+  T* sP = sV + KB * KRP;
+  U* sS = reinterpret_cast<U*>(sP + QT * PRP);
+  U* sB = sS + QT * SRP;
+  U* sF = sB + QT * SRP;
+  U* sL = sF + QT;
+
+  const int lane_idx = threadIdx.x;
+  const int warp_idx = threadIdx.y;
+  const int tid = threadIdx.x + threadIdx.y * 32;
+
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+
+  const int batch_idx = blockIdx.z;
+  const int head_idx = blockIdx.x;
+  const int kv_head_idx = head_idx / params.gqa_factor;
+  const int q0 = blockIdx.y * QT;
+
+  const U scale_log2 = params.scale * M_LOG2E;
+
+  const T* Qg =
+      Q + batch_idx * params.Q_strides[0] + head_idx * params.Q_strides[1];
+  const T* Kg =
+      K + batch_idx * params.K_strides[0] + kv_head_idx * params.K_strides[1];
+  const T* Vg =
+      V + batch_idx * params.V_strides[0] + kv_head_idx * params.V_strides[1];
+  T* Og = O + batch_idx * params.O_strides[0] + head_idx * params.O_strides[1];
+
+  const T* Mg = nullptr;
+  if (M) {
+    Mg = M + batch_idx * params.M_strides[0] +
+        (params.maskH == 1 ? 0 : head_idx * params.M_strides[1]);
+  }
+
+  constexpr int QLIT = QT * (D / VEC) / THREADS;
+  AlignedVector<T, VEC> q_reg[QLIT];
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < QLIT; ++i) {
+    const int idx = tid + i * THREADS;
+    const int r = idx / (D / VEC);
+    const int c = (idx % (D / VEC)) * VEC;
+    const int qr = min(q0 + r, params.qL - 1);
+    q_reg[i] = load_vector<VEC>(Qg + qr * params.Q_strides[2] + c, 0);
+  }
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < QLIT; ++i) {
+    const int idx = tid + i * THREADS;
+    const int r = idx / (D / VEC);
+    const int c = (idx % (D / VEC)) * VEC;
+    *reinterpret_cast<AlignedVector<T, VEC>*>(sQ + r * KRP + c) = q_reg[i];
+  }
+
+  U max_score_r0 = Limits<U>::finite_min();
+  U max_score_r1 = Limits<U>::finite_min();
+  U sum_exp_r0 = 0.f;
+  U sum_exp_r1 = 0.f;
+  if (sinks) {
+    const U sink = M_LOG2E * static_cast<U>(sinks[head_idx]);
+    max_score_r0 = sink;
+    max_score_r1 = sink;
+    sum_exp_r0 = 1.f;
+    sum_exp_r1 = 1.f;
+  }
+
+  FragC o_acc[NFRAG];
+  PRAGMA_LOOP_UNROLL
+  for (int i = 0; i < NFRAG; ++i) {
+    o_acc[i] = {0.f, 0.f, 0.f, 0.f};
+  }
+
+  for (int kv0 = 0; kv0 < params.kL; kv0 += KB) {
+    // Use-key verdict tile (sequence bounds + causal + additive mask).
+    for (int idx = tid; idx < QT * KB; idx += THREADS) {
+      const int rj = idx / KB;
+      const int rkv = idx % KB;
+      const int kv_glob = kv0 + rkv;
+      const int qr = min(q0 + rj, params.qL - 1);
+      U bias = -INFINITY;
+      bool use_key = kv_glob < params.kL;
+      if constexpr (do_causal) {
+        use_key = use_key && (kv_glob <= (params.kL - params.qL + qr));
+      }
+      if (use_key && Mg) {
+        bias =
+            static_cast<U>(
+                Mg[qr * params.M_strides[2] + kv_glob * params.M_strides[3]]) *
+            M_LOG2E;
+        use_key = bias >= Limits<U>::finite_min() || isnan(bias);
+        if (!use_key) {
+          bias = -INFINITY;
+        }
+      } else if (use_key) {
+        bias = 0.f;
+      }
+      sB[rj * SRP + rkv] = bias;
+    }
+    block.sync();
+
+    // Skip tiles where every query/key pair is masked (sliding-window and
+    // above-diagonal causal tiles). __syncthreads_or is the barrier too, so
+    // no shared flag is needed across iterations.
+    int any_live = 0;
+    for (int idx = tid; idx < QT * KB; idx += THREADS) {
+      const int rj = idx / KB;
+      const int rkv = idx % KB;
+      any_live |= (sB[rj * SRP + rkv] != -INFINITY) ? 1 : 0;
+    }
+    if (__syncthreads_or(any_live) == 0) {
+      continue;
+    }
+
+    // Cooperative load of the K and V tiles (register staged).
+    constexpr int LITERS = KB * (D / VEC) / THREADS;
+    AlignedVector<T, VEC> k_reg[LITERS];
+    AlignedVector<T, VEC> v_reg[LITERS];
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < LITERS; ++i) {
+      const int idx = tid + i * THREADS;
+      const int r = idx / (D / VEC);
+      const int c = (idx % (D / VEC)) * VEC;
+      const int kr = min(kv0 + r, params.kL - 1);
+      k_reg[i] = load_vector<VEC>(Kg + kr * params.K_strides[2] + c, 0);
+      v_reg[i] = load_vector<VEC>(Vg + kr * params.V_strides[2] + c, 0);
+    }
+    PRAGMA_LOOP_UNROLL
+    for (int i = 0; i < LITERS; ++i) {
+      const int idx = tid + i * THREADS;
+      const int r = idx / (D / VEC);
+      const int c = (idx % (D / VEC)) * VEC;
+      *reinterpret_cast<AlignedVector<T, VEC>*>(sK + r * KRP + c) = k_reg[i];
+      *reinterpret_cast<AlignedVector<T, VEC>*>(sV + r * KRP + c) = v_reg[i];
+    }
+    block.sync();
+
+    // Scores via tensor cores: warp w (< NB) computes the 16 x 8 score slab
+    // for kv columns [w*8, w*8+8).
+    if (warp_idx < NB) {
+      FragC cfrag = {0.f, 0.f, 0.f, 0.f};
+      const int n0 = warp_idx * 8;
+      PRAGMA_LOOP_UNROLL
+      for (int d0 = 0; d0 < D; d0 += 16) {
+        FragA a;
+        ldsm_A(a, sQ + d0, KRP);
+        FragB b;
+        ldsm_scores_B(b, sK + n0 * KRP + d0, KRP);
+        mma<T>(cfrag, a, b);
+      }
+      PRAGMA_LOOP_UNROLL
+      for (int h = 0; h < 2; ++h) {
+        const int r = frag_row(lane_idx, h);
+        const int c0 = frag_col(lane_idx, 0);
+        // Store pre-softmax scores scaled to the log2 domain. Masked entries
+        // in sB are -inf and dominate the sum.
+        sS[r * SRP + n0 + c0] =
+            cfrag.r[h * 2 + 0] * scale_log2 + sB[r * SRP + n0 + c0];
+        sS[r * SRP + n0 + c0 + 1] =
+            cfrag.r[h * 2 + 1] * scale_log2 + sB[r * SRP + n0 + c0 + 1];
+      }
+    }
+    block.sync();
+
+    // Softmax update: warp w owns rows {w, w+8}; lanes span the KB columns.
+    {
+      const int row0 = warp_idx;
+      const int row1 = warp_idx + 8;
+      U x0 = sS[row0 * SRP + lane_idx];
+      U x1 = sS[row1 * SRP + lane_idx];
+      if (lane_idx >= KB) {
+        x0 = -INFINITY;
+        x1 = -INFINITY;
+      }
+      U tile_max0 = cg::reduce(warp, x0, cg::greater<U>());
+      U tile_max1 = cg::reduce(warp, x1, cg::greater<U>());
+      U new_max0 = max(max_score_r0, tile_max0);
+      U new_max1 = max(max_score_r1, tile_max1);
+      const U factor0 = exp2f(max_score_r0 - new_max0);
+      const U factor1 = exp2f(max_score_r1 - new_max1);
+      const U e0 = (x0 == -INFINITY || new_max0 == Limits<U>::finite_min())
+          ? 0.f
+          : exp2f(x0 - new_max0);
+      const U e1 = (x1 == -INFINITY || new_max1 == Limits<U>::finite_min())
+          ? 0.f
+          : exp2f(x1 - new_max1);
+      U tile_sum0 = cg::reduce(warp, e0, cg::plus<U>());
+      U tile_sum1 = cg::reduce(warp, e1, cg::plus<U>());
+      sum_exp_r0 = sum_exp_r0 * factor0 + tile_sum0;
+      sum_exp_r1 = sum_exp_r1 * factor1 + tile_sum1;
+      max_score_r0 = new_max0;
+      max_score_r1 = new_max1;
+      // Publish exp weights as bf16 A fragments and row rescale factors.
+      if (lane_idx < KB) {
+        sP[row0 * PRP + lane_idx] = static_cast<T>(e0);
+        sP[row1 * PRP + lane_idx] = static_cast<T>(e1);
+      }
+      if (lane_idx == 0) {
+        sF[row0] = factor0;
+        sF[row1] = factor1;
+        sL[row0] = sum_exp_r0;
+        sL[row1] = sum_exp_r1;
+      }
+    }
+    block.sync();
+
+    // PV accumulation via tensor cores: each warp owns a D-slice.
+    {
+      const int dslice0 = warp_idx * DSLICE;
+      // Rescale by each fragment row's factor.
+      const U f0 = sF[frag_row(lane_idx, 0)];
+      const U f1 = sF[frag_row(lane_idx, 1)];
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < NFRAG; ++i) {
+        o_acc[i].r[0] *= f0;
+        o_acc[i].r[1] *= f0;
+        o_acc[i].r[2] *= f1;
+        o_acc[i].r[3] *= f1;
+      }
+      for (int k0 = 0; k0 < KB; k0 += 16) {
+        FragA pa;
+        ldsm_A(pa, sP + k0, PRP);
+        PRAGMA_LOOP_UNROLL
+        for (int i = 0; i < NFRAG; ++i) {
+          FragB vb;
+          ldsm_pv_B(vb, sV + k0 * KRP + dslice0 + i * 8, KRP);
+          mma<T>(o_acc[i], pa, vb);
+        }
+      }
+    }
+    block.sync();
+  }
+
+  // Write output rows from the PV D-slice fragments.
+  {
+    const int dslice0 = warp_idx * DSLICE;
+    const U inv0 = sL[frag_row(lane_idx, 0)] == 0.f
+        ? 0.f
+        : __frcp_rn(sL[frag_row(lane_idx, 0)]);
+    const U inv1 = sL[frag_row(lane_idx, 1)] == 0.f
+        ? 0.f
+        : __frcp_rn(sL[frag_row(lane_idx, 1)]);
+    PRAGMA_LOOP_UNROLL
+    for (int h = 0; h < 2; ++h) {
+      const int r = frag_row(lane_idx, h);
+      if (q0 + r >= params.qL) {
+        continue;
+      }
+      const U inv = h == 0 ? inv0 : inv1;
+      PRAGMA_LOOP_UNROLL
+      for (int i = 0; i < NFRAG; ++i) {
+        const int c0 = dslice0 + i * 8 + frag_col(lane_idx, 0);
+        AlignedVector<T, 2> out;
+        out[0] = static_cast<T>(o_acc[i].r[h * 2 + 0] * inv);
+        out[1] = static_cast<T>(o_acc[i].r[h * 2 + 1] * inv);
+        *reinterpret_cast<AlignedVector<T, 2>*>(
+            Og + (q0 + r) * params.O_strides[2] + c0) = out;
+      }
+    }
+  }
+}
+
 template <typename T, bool do_causal, int D>
 __global__ void kernel_sdpav_2pass_1(
     const T* Q,
@@ -1548,6 +1885,66 @@ void sdpa_vector_fmma_launch(
       static_cast<float*>(nullptr));
 }
 
+template <typename DataType, bool do_causal, int D>
+void sdpa_vector_tmma_launch(
+    cu::CommandEncoder& encoder,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& o,
+    const std::optional<array>& mask_arr,
+    const std::optional<array>& sinks,
+    cu::AttnParams params) {
+  constexpr int QT = 16;
+  constexpr int KB = D == 256 ? 32 : 16;
+  constexpr int KRP = D + 8;
+  constexpr int PRP = KB + 8;
+  constexpr int SRP = KB + 1;
+  constexpr int THREADS = 256;
+
+  const uint32_t smem_bytes = (QT + 2 * KB) * KRP * sizeof(DataType) +
+      QT * PRP * sizeof(DataType) + (2 * QT * SRP + 2 * QT) * sizeof(float);
+
+  auto kernel = cu::kernel_sdpav_tmma<DataType, do_causal, D>;
+  static std::once_flag smem_once;
+  std::call_once(smem_once, [&]() {
+    auto status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+          "kernel_sdpav_tmma: failed to set shared memory attribute");
+    }
+  });
+
+  encoder.set_input_array(q);
+  encoder.set_input_array(k);
+  encoder.set_input_array(v);
+  if (sinks) {
+    encoder.set_input_array(*sinks);
+  }
+  if (mask_arr) {
+    encoder.set_input_array(*mask_arr);
+  }
+  encoder.set_output_array(o);
+
+  dim3 grid_dim(params.H, (params.qL + QT - 1) / QT, params.B);
+  dim3 block_dim(32, THREADS / 32, 1);
+
+  encoder.add_kernel_node_ex(
+      kernel,
+      grid_dim,
+      block_dim,
+      {},
+      smem_bytes,
+      gpu_ptr<DataType>(q),
+      gpu_ptr<DataType>(k),
+      gpu_ptr<DataType>(v),
+      gpu_ptr<DataType>(o),
+      mask_arr ? gpu_ptr<DataType>(*mask_arr) : nullptr,
+      sinks ? gpu_ptr<DataType>(*sinks) : nullptr,
+      params);
+}
+
 // Build the shared AttnParams used by the tiled prefill attention variants.
 cu::AttnParams sdpa_tiled_params(
     const array& q,
@@ -1597,7 +1994,8 @@ bool sdpa_vector_fvec_route(
     const std::optional<array>& mask_arr,
     const std::optional<array>& sinks) {
   static bool enabled = env::get_var("MLX_CUDA_SDPA_FVEC_PREFILL", 0);
-  if (!enabled) {
+  static bool tmma_enabled = env::get_var("MLX_CUDA_SDPA_TMMA_PREFILL", 0);
+  if (!enabled && !tmma_enabled) {
     return false;
   }
 
@@ -1621,6 +2019,38 @@ bool sdpa_vector_fvec_route(
   }
 
   cu::AttnParams params = sdpa_tiled_params(q, k, v, scale, o, mask_arr);
+
+  // The tmma variant (fmma's tile architecture with ldmatrix B-operands;
+  // replaces the undefined-upper-half memcpy gathers) takes precedence when
+  // enabled.
+  if (tmma_enabled && (o.dtype() == bfloat16 || o.dtype() == float16)) {
+    dispatch_bool(do_causal, [&](auto causal_tag) {
+      if (o.dtype() == bfloat16) {
+        using DataType = __nv_bfloat16;
+        if (head_dim == 256) {
+          sdpa_vector_tmma_launch<DataType, causal_tag.value, 256>(
+              encoder, q, k, v, o, mask_arr, sinks, params);
+        } else {
+          sdpa_vector_tmma_launch<DataType, causal_tag.value, 512>(
+              encoder, q, k, v, o, mask_arr, sinks, params);
+        }
+      } else {
+        using DataType = __half;
+        if (head_dim == 256) {
+          sdpa_vector_tmma_launch<DataType, causal_tag.value, 256>(
+              encoder, q, k, v, o, mask_arr, sinks, params);
+        } else {
+          sdpa_vector_tmma_launch<DataType, causal_tag.value, 512>(
+              encoder, q, k, v, o, mask_arr, sinks, params);
+        }
+      }
+    });
+    return true;
+  }
+
+  if (!enabled) {
+    return false;
+  }
 
   // Tensor-core variant (bf16/f16 only) takes precedence when enabled.
   // DRIVER-BUG WORKAROUND: kernel_sdpav_fmma produces corrupted output
