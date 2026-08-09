@@ -997,18 +997,6 @@ __global__ void kernel_sdpav_tmma(
         (params.maskH == 1 ? 0 : head_idx * params.M_strides[1]);
   }
 
-#ifdef TMMA_SABOTAGE_ZEROS
-  // Sabotage build for route-engagement proof: write zeros where this block
-  // owns output rows, then return. If model output degenerates with this
-  // engaged, the tmma route is the path the runner actually takes.
-  for (int idx = tid; idx < QT * D; idx += THREADS) {
-    if (q0 + idx / D < params.qL) {
-      Og[(q0 + idx / D) * params.O_strides[2] + idx % D] = T(0.f);
-    }
-  }
-  return;
-#endif
-
   constexpr int QLIT = QT * (D / VEC) / THREADS;
   AlignedVector<T, VEC> q_reg[QLIT];
   PRAGMA_LOOP_UNROLL
