@@ -79,7 +79,14 @@ class CudaAllocator : public allocator::Allocator {
   size_t free_limit_;
   size_t total_memory_;
   size_t max_pool_size_;
-  BufferCache<CudaBuffer> buffer_cache_;
+  // Buffers are cached by size only, so the cache must be split by residency:
+  // a host/unified buffer must never satisfy a device allocation (every
+  // kernel using it would silently run over the slow path).
+  BufferCache<CudaBuffer> buffer_cache_; // unified/host (device == -1)
+  BufferCache<CudaBuffer> device_cache_; // device-resident
+  BufferCache<CudaBuffer>& cache_for(int device) {
+    return device < 0 ? buffer_cache_ : device_cache_;
+  }
   size_t active_memory_{0};
   size_t peak_memory_{0};
   std::vector<CudaStream> free_streams_;
