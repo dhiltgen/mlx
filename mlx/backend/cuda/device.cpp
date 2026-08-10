@@ -200,6 +200,9 @@ std::pair<int, int> get_graph_limits(Device& d) {
       mb = 8000;
       break;
     case 1210: // SM121 Blackwell
+      // Conservative baseline: prefill graphs are bounded to keep graph
+      // memory off the hot decode topologies; the ops sweep measured the
+      // sweet spot via the small-batch caps below instead.
       ops = 20;
       mb = 25;
       break;
@@ -230,6 +233,12 @@ CommandEncoder::CommandEncoder(Device& d)
   if (cc == 1210) {
     // Small-batch graphs need enough work to amortize SM121 launch costs,
     // while prefill keeps the conservative defaults to bound graph memory.
+    // Measured on GB10 (ops sweep, 12-row matrix 2026-08): ops=400 wins
+    // prefill ~4-7%; MB>=512 collapses decode via graph-cache eviction of
+    // decode topologies; MB<=128 keeps them resident => ops=400/MB=64 is
+    // the deployed runtime config (env, not compiled-in, because the effect
+    // is driver-specific: on the Windows SM121 (N1x, 615.x) line the SAME
+    // env collapses decode -27 to -57%; defaults stay conservative there).
     max_small_batch_ops_per_graph_ =
         env::get_var("MLX_MAX_OPS_PER_BUFFER", 400);
     max_small_batch_mb_per_graph_ = env::get_var("MLX_MAX_MB_PER_BUFFER", 512);
