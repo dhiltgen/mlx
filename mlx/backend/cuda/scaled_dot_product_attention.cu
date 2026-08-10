@@ -209,8 +209,6 @@ __global__ void kernel_sdpav_1pass(
   }
 }
 
-}
-
 // Tensor-core (mma.sync m16n8k16 bf16/f16) fragment helpers for the
 // query-tiled flash attention kernels: A/B/C fragment types, mma wrappers,
 // and the ldmatrix-based loads shared by the tmma route.
