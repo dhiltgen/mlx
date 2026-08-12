@@ -7,7 +7,10 @@
 
 #include <fmt/format.h>
 #include <nvtx3/nvtx3.hpp>
+#include <cstdio>
 #include <future>
+#include <string>
+#include <vector>
 #include <unordered_set>
 
 namespace mlx::core::cu {
@@ -511,6 +514,71 @@ bool CommandEncoder::needs_commit() {
   return (node_count_ > max_ops) || ((bytes_in_graph_ >> 20) > max_mb);
 }
 
+
+namespace {
+
+// Probe: MLX_TAPE_DUMP=<file> dumps every committed graph's kernel node
+// params (raw bytes) for cross-token dynamic-field discovery.
+void tape_dump_graph(cudaGraph_t graph, int count) {
+  static const char* env = std::getenv("MLX_TAPE_DUMP");
+  if (!env || !*env) {
+    return;
+  }
+  FILE* f = fopen(env, "a");
+  if (!f) {
+    return;
+  }
+  size_t num_nodes = 0;
+  cudaGraphGetNodes(graph, nullptr, &num_nodes);
+  std::vector<cudaGraphNode_t> nodes(num_nodes);
+  cudaGraphGetNodes(graph, nodes.data(), &num_nodes);
+  fprintf(f, "COMMIT %d nodes=%zu\n", count, num_nodes);
+  int idx = 0;
+  for (auto n : nodes) {
+    cudaGraphNodeType type;
+    cudaGraphNodeGetType(n, &type);
+    if (type != cudaGraphNodeTypeKernel) {
+      fprintf(f, "  N%d type=%d\n", idx++, (int)type);
+      continue;
+    }
+    cudaKernelNodeParams p;
+    cudaGraphKernelNodeGetParams(n, &p);
+    // Resolve param sizes via the driver API; fall back to pointer dump.
+    CUkernel kern = nullptr;
+    cudaGetKernel(reinterpret_cast<cudaKernel_t*>(&kern), p.func);
+    std::string line;
+    char buf[64];
+    snprintf(buf, sizeof buf, "  N%d K func=%p grid=(%u,%u,%u) blk=(%u,%u,%u)", idx++, p.func,
+        p.gridDim.x, p.gridDim.y, p.gridDim.z, p.blockDim.x, p.blockDim.y, p.blockDim.z);
+    line = buf;
+    if (kern != nullptr) {
+      for (unsigned pi = 0; pi < 32 && p.kernelParams[pi] != nullptr; ++pi) {
+        size_t size = 0, off = 0;
+        if (cuKernelGetParamInfo(kern, pi, &off, &size) == CUDA_SUCCESS) {
+          char pbuf[256];
+          snprintf(pbuf, sizeof pbuf, " p%u(%zu)=", pi, size);
+          line += pbuf;
+          const unsigned char* bytes = static_cast<const unsigned char*>(p.kernelParams[pi]);
+          for (size_t b = 0; b < size && b < 16; ++b) {
+            snprintf(pbuf, sizeof pbuf, "%02x", bytes[b]);
+            line += pbuf;
+          }
+        } else {
+          char pbuf[32];
+          snprintf(pbuf, sizeof pbuf, " p%u=?", pi);
+          line += pbuf;
+          break;
+        }
+      }
+    }
+    fprintf(f, "%s\n", line.c_str());
+  }
+  fflush(f);
+  fclose(f);
+}
+
+} // namespace
+
 void CommandEncoder::commit() {
   nvtx3::scoped_range r("CommandEncoder::commit");
   if (!temporaries_.empty()) {
@@ -532,6 +600,9 @@ void CommandEncoder::commit() {
     }
 
     device_.make_current();
+
+    static int tape_count = 0;
+    tape_dump_graph(graph_, ++tape_count);
 
     if (!is_graph_updatable_) {
       CudaGraphExec graph_exec;
