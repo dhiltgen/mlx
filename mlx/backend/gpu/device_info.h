@@ -28,6 +28,8 @@ MLX_API int device_count();
  *   - uuid (string): Device UUID (CUDA only)
  *   - pci_bus_id (string): PCI bus ID (CUDA only)
  *   - compute_capability_major/minor (size_t): Compute capability (CUDA only)
+ *   - cuda_compilation_targets (string): Semicolon-separated CUDA compilation
+ *     targets using NVIDIA's sm_* and compute_* notation
  */
 MLX_API const
     std::unordered_map<std::string, std::variant<std::string, size_t>>&

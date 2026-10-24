@@ -179,6 +179,12 @@ class TestDeviceInfo(mlx_tests.MLXTestCase):
             self.assertIn("device_name", info)
             self.assertTrue(len(info["device_name"]) > 0)
             self.assertIn("architecture", info)
+            if mx.cuda.is_available():
+                self.assertIn("cuda_compilation_targets", info)
+                targets = info["cuda_compilation_targets"].split(";")
+                self.assertTrue(targets)
+                for target in targets:
+                    self.assertRegex(target, r"^(sm|compute)_[0-9]+[af]?$")
 
     def test_device_info_default(self):
         info = mx.device_info()

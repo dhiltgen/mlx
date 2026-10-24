@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include "mlx/backend/gpu/device_info.h"
+#include "cuda_build_info.h"
 #include "mlx/backend/cuda/cuda.h"
 
 #include <cuda_runtime.h>
@@ -150,6 +151,7 @@ device_info_impl(int device_index) {
       // Compute capability as size_t (to match Metal's variant type)
       dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
       dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
+      dev.info["cuda_compilation_targets"] = cu::compilation_targets;
 
       devices.push_back(std::move(dev));
     }
